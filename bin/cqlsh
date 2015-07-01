@@ -1551,18 +1551,7 @@ class Shell(cmd.Cmd):
         print "\n%d rows %s in %s." % (rows, verb, describe_interval(timeend - timestart))
 
     def perform_csv_import(self, ks, cf, columns, fname, opts):
-        dialect_options = self.csv_dialect_defaults.copy()
-        if 'quote' in opts:
-            dialect_options['quotechar'] = opts.pop('quote')
-        if 'escape' in opts:
-            dialect_options['escapechar'] = opts.pop('escape')
-        if 'delimiter' in opts:
-            dialect_options['delimiter'] = opts.pop('delimiter')
-        nullval = opts.pop('null', '')
-        header = bool(opts.pop('header', '').lower() == 'true')
-        if dialect_options['quotechar'] == dialect_options['escapechar']:
-            dialect_options['doublequote'] = True
-            del dialect_options['escapechar']
+        opts, dialect_options, nullval, header, _ = _setup_csv_options(opts)
         if opts:
             self.printerr('Unrecognized COPY FROM options: %s'
                           % ', '.join(opts.keys()))
@@ -1811,20 +1800,7 @@ class Shell(cmd.Cmd):
             new_cluster.shutdown()
 
     def perform_csv_export(self, ks, cf, columns, fname, opts):
-        dialect_options = self.csv_dialect_defaults.copy()
-        if 'quote' in opts:
-            dialect_options['quotechar'] = opts.pop('quote')
-        if 'escape' in opts:
-            dialect_options['escapechar'] = opts.pop('escape')
-        if 'delimiter' in opts:
-            dialect_options['delimiter'] = opts.pop('delimiter')
-        encoding = opts.pop('encoding', 'utf8')
-        nullval = opts.pop('null', '')
-        header = bool(opts.pop('header', '').lower() == 'true')
-        if dialect_options['quotechar'] == dialect_options['escapechar']:
-            dialect_options['doublequote'] = True
-            del dialect_options['escapechar']
-
+        opts, dialect_options, nullval, header, encoding = _setup_csv_options(opts)
         if opts:
             self.printerr('Unrecognized COPY TO options: %s'
                           % ', '.join(opts.keys()))
@@ -1866,6 +1842,22 @@ class Shell(cmd.Cmd):
         columnlist = ', '.join(protect_names(columns))
         query = 'SELECT %s FROM %s.%s' % (columnlist, protect_name(ks), protect_name(cf))
         return self.session.execute(query)
+
+    def _setup_csv_options(self, opts):
+        dialect_options = self.csv_dialect_defaults.copy()
+        if 'quote' in opts:
+            dialect_options['quotechar'] = opts.pop('quote')
+        if 'escape' in opts:
+            dialect_options['escapechar'] = opts.pop('escape')
+        if 'delimiter' in opts:
+            dialect_options['delimiter'] = opts.pop('delimiter')
+        nullval = opts.pop('null', '')
+        header = bool(opts.pop('header', '').lower() == 'true')
+        encoding = opts.pop('encoding', 'utf8')
+        if dialect_options['quotechar'] == dialect_options['escapechar']:
+            dialect_options['doublequote'] = True
+            del dialect_options['escapechar']
+        return opts, dialect_options, nullval, header, encoding
 
     def do_show(self, parsed):
         """
