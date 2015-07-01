@@ -795,11 +795,11 @@ class Shell(cmd.Cmd):
     def get_keyspaces(self):
         return self.conn.metadata.keyspaces.values()
 
-    def get_ring(self):
-        if self.current_keyspace is None or self.current_keyspace == 'system':
+    def get_ring(self, ksname):
+        if ksname is None or ksname == 'system':
             raise NoKeyspaceError("Ring view requires a current non-system keyspace")
-        self.conn.metadata.token_map.rebuild_keyspace(self.current_keyspace, build_if_absent=True)
-        return self.conn.metadata.token_map.tokens_to_hosts_by_ks[self.current_keyspace]
+        self.conn.metadata.token_map.rebuild_keyspace(ksname, build_if_absent=True)
+        return self.conn.metadata.token_map.tokens_to_hosts_by_ks[ksname]
 
     def get_table_meta(self, ksname, tablename):
         if ksname is None:
@@ -1354,7 +1354,7 @@ class Shell(cmd.Cmd):
         if self.current_keyspace is not None \
         and self.current_keyspace != 'system':
             print "Range ownership:"
-            ring = self.get_ring()
+            ring = self.get_ring(self.current_keyspace) 
             for entry in ring.items():
                 print ' %39s  [%s]' % (str(entry[0].value), ', '.join([host.address for host in entry[1]]))
             print
