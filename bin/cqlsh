@@ -52,6 +52,7 @@ import warnings
 import csv
 import getpass
 from functools import partial
+import multiprocessing as multp
 import itertools
 import traceback
 
@@ -448,6 +449,26 @@ class UserTypeNotFound(Exception):
     pass
 
 
+class NoLocalNodeError(Exception):
+    verb = "find"
+
+    def __init__(self, token, hosts, dc):
+        self.token = token
+        self.hosts = hosts
+        self.dc = dc
+
+    def __str__(self):
+        return str(self.token)
+
+    def message(self):
+        what = 'host from %s (for token %s) in current data center %s' \
+                % (', '.join(self.hosts), self.token, self.dc)
+        return 'Failed to %s %s, please use cqlsh in that DC' % (self.verb, what)
+
+    def __repr__(self):
+        return '<%s %s>' % (self.__class__.__name__, self.message())
+
+
 class DecodeError(Exception):
     verb = 'decode'
 
@@ -804,14 +825,38 @@ class Shell(cmd.Cmd):
 
     def get_token_ranges(self):
         """
-        Returns an iterator of the different token ranges of the cluster. For
-        example if you had a ring of nodes ["A", "B", "C", "D", "E"] then the
-        iterator would yield ("A", "B"), ("B", "C"), ..., ("D", "E"), ("E", "A")
+        Returns a list of the different token ranges of the cluster. For example
+        if you had a ring of nodes ["A", "B", "C", "D", "E"] then the list would
+        be [("A", "B"), ("B", "C"), ("C", "D"), ("D", "E")]
         """
+        ranges = []
         ring = self.conn.metadata.token_map.ring
-        a, b = itertools.tee(ring)
-        next(b, None)
-        return itertools.izip_longest(a, b, fillvalue=ring[0])
+        for i in xrange(len(ring)):
+            try:
+                ranges.append((ring[i], ring[i+1]))
+            except IndexError:
+                continue
+        return ranges
+
+    def get_token_range_to_local_host(self, ksname):
+        """
+        Returns a list of tuples of (token range, local host) of the keyspace.
+        If a token range does not have replicas within the same datacenter as 
+        the cqlsh instance then a NoLocalNodeError is raised.
+        """
+        pairs = []
+        tm = self.conn.metadata.token_map
+        dc = self.conn.metadata.get_host(self.hostname).datacenter
+        for start_token, end_token in self.get_token_ranges():
+            hosts = tm.get_replicas(ksname, end_token)
+            for host in hosts:
+                if host.datacenter == dc:
+                    token_range = (start_token.value, end_token.value)
+                    pairs.append((token_range, host))
+                    break
+            else:
+                raise NoLocalNodeError(end_token, hosts, dc)
+        return pairs
 
     def get_table_meta(self, ksname, tablename):
         if ksname is None:
@@ -1526,7 +1571,7 @@ class Shell(cmd.Cmd):
         opts = dict(zip(copyoptnames, cleancopyoptvals))
 
         timestart = time.time()
-
+        
         direction = parsed.get_binding('dir').upper()
         if direction == 'FROM':
             rows = self.perform_csv_import(ks, cf, columns, fname, opts)
@@ -1541,11 +1586,12 @@ class Shell(cmd.Cmd):
         print "\n%d rows %s in %s." % (rows, verb, describe_interval(timeend - timestart))
 
     def perform_csv_import(self, ks, cf, columns, fname, opts):
-        opts, dialect_options, nullval, header, _ = _setup_csv_options(opts)
+        opts, dialect_options, csv_options = self._setup_csv_options(opts)
         if opts:
             self.printerr('Unrecognized COPY FROM options: %s'
                           % ', '.join(opts.keys()))
             return 0
+        nullval, header = csv_options['nullval'], csv_options['header']
 
         if fname is None:
             do_close = False
@@ -1573,15 +1619,16 @@ class Shell(cmd.Cmd):
             # a single local Cassandra node busy, and I see lower throughput
             # with more processes.
             try:
-                num_processes = max(1, min(4, cpu_count() - 1))
+                num_processes = max(1, min(4, multp.cpu_count() - 1))
             except NotImplementedError:
                 num_processes = 1
 
             processes, pipes = [], [],
             for i in range(num_processes):
-                parent_conn, child_conn = Pipe()
+                parent_conn, child_conn = multp.Pipe()
                 pipes.append(parent_conn)
-                processes.append(Process(target=self.multiproc_import, args=(child_conn, ks, cf, columns, nullval)))
+                proc_args = (child_conn, ks, cf, columns, nullval)
+                processes.append(multp.Process(target=self.multiproc_import, args=proc_args))
 
             for process in processes:
                 process.start()
@@ -1790,11 +1837,13 @@ class Shell(cmd.Cmd):
             new_cluster.shutdown()
 
     def perform_csv_export(self, ks, cf, columns, fname, opts):
-        opts, dialect_options, nullval, header, encoding = _setup_csv_options(opts)
+        opts, dialect_options, csv_options = self._setup_csv_options(opts)
         if opts:
-            self.printerr('Unrecognized COPY TO options: %s'
-                          % ', '.join(opts.keys()))
+            self.printerr('Unrecognized COPY TO options: %s' % ', '.join(opts.keys()))
             return 0
+        
+        csv_options['dtformats'] = self.display_time_format
+        csv_options['float_precision'] = self.display_float_precision
 
         if fname is None:
             do_close = False
@@ -1807,31 +1856,170 @@ class Shell(cmd.Cmd):
                 self.printerr("Can't open %r for writing: %s" % (fname, e))
                 return 0
 
-        meter = RateMeter(10000)
+        rows_exported = 0
+
         try:
+            # Organize the token ranges with their respective host
+            ranges_and_hosts = self.get_token_range_to_local_host(ks)
+            host_to_ranges = dict()
+            for token_range, host in ranges_and_hosts:
+                host_to_ranges.setdefault(host, []).append(token_range)
+        except NoLocalNodeError, exc:
+            # We failed before we started because a token range had no local nodes
+            self.printerr('\nError starting export process:\n')
+            self.printerr(str(exc))
+            if self.debug:
+                traceback.print_exc()
+            return rows_exported
 
-            dump = self.prep_export_dump(ks, cf, columns)
-            writer = csv.writer(csvdest, **dialect_options)
-            if header:
-                writer.writerow(columns)
-            for row in dump:
-                fmt = lambda v: \
-                    format_value(v, output_encoding=encoding, nullval=nullval,
-                                 time_format=self.display_time_format,
-                                 float_precision=self.display_float_precision).strval
-                writer.writerow(map(fmt, row.values()))
-                meter.increment()
-        finally:
-            if do_close:
-                csvdest.close()
-        return meter.current_record
+        # Create and start a subprocess for each host that runs multiproc_export() on
+        # the token ranges that the host owns
+        processes = []
+        pipe, conn = multp.Pipe()
+        for host, token_ranges in host_to_ranges.iteritems():
+            proc_args = (
+                    host.address,
+                    token_ranges,
+                    conn,
+                    ks,
+                    cf,
+                    columns,
+                    dialect_options,
+                    csv_options,
+                    )
+            processes.append(multp.Process(target=self.multiproc_export, args=proc_args))
 
-    def prep_export_dump(self, ks, cf, columns):
+        for process in processes:
+            process.start()
+
+        # Block and wait for all the queries to complete (either successfully or fails)
+        # Unblock once all results are in
+        # Print out errors and write tempfiles to file
+        # Return number of successfully exported rows
+        from collections import OrderedDict
+        results = OrderedDict((token_ranges, None) for token_ranges, _ in ranges_and_hosts)
+
+        results_expected = len(results)
+        results_received = 0
+        while results_received < results_expected:
+            try:
+                token_range, result = pipe.recv()
+                results[token_range] = result
+                results_received += 1
+            except EOFError:
+                time.sleep(0.01)
+
+        writer = csv.writer(csvdest, **dialect_options)
+        if csv_options["header"]:
+            writer.writerow(columns)
+        for token_range, result in results.iteritems():
+            if result is None:
+                continue
+            elif isinstance(result, Exception):
+                # A token range failed to be exported
+                self.printerr('\nError exporting from token range: (%d, %d):\n' % token_range)
+                self.printerr(str(result))
+                if self.debug:
+                    traceback.print_exc()
+            else:
+                try:
+                    with open(result, "rb") as tmp:
+                        tmp_reader = csv.reader(tmp, **dialect_options)
+                        for row in tmp_reader:
+                            writer.writerow(row)
+                            rows_exported += 1
+                except Exception, e:
+                    raise e
+                finally:
+                    os.remove(result)
+
+        if do_close:
+            csvdest.close()
+        pipe.close()
+        return rows_exported
+
+    def multiproc_export(self, hostname, ranges, pipe, ks, cf, columns, dialect_opts, csv_opts):
+        # Open new connection to specific hostname for this subprocess
+        new_cluster = Cluster(
+                contact_points=(hostname,),
+                port=self.port,
+                cql_version=self.conn.cql_version,
+                protocol_version=DEFAULT_PROTOCOL_VERSION,
+                auth_provider=self.auth_provider,
+                ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
+                load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
+                compression=None,
+                )
+        session = new_cluster.connect(self.keyspace)
+        session.row_factory = ordered_dict_factory
+
+        def result_callback(result, token_range, pipe, dialect_opts, csv_opts):
+            # Query has successfully completed so parse and format the results
+            # if there are any, write it to a temp file and send the filename
+            # back to parent process.
+            message = None
+            try:
+                if result:
+                    from tempfile import NamedTemporaryFile
+                    f = NamedTemporaryFile(delete=False)
+                    writer = csv.writer(f, **dialect_opts)
+                    def fmt(v):
+                        return format_value(
+                                v, 
+                                output_encoding=csv_opts['encoding'],
+                                nullval=csv_opts['nullval'],
+                                time_format=csv_opts['dtformats'],
+                                float_precision=csv_opts['float_precision'],
+                                ).strval
+                    for row in result:
+                        writer.writerow(map(fmt, row.values()))
+                    f.close()
+                    message = f.name
+            except Exception, exc:
+                message = exc
+            pipe.send((token_range, message))
+
+        def err_callback(err, token_range, pipe):
+            # Query errored out so send error back to parent process.
+            pipe((token_range, err))
+
+        # Asynchronously run the query for all the given token ranges
+        for token_range in ranges:
+            query = self._prepare_export_query(ks, cf, columns, token_range)
+            future = session.execute_async(query)
+            future.add_callbacks(
+                    callback=result_callback,
+                    callback_args=(token_range, pipe, dialect_opts, csv_opts),
+                    errback=err_callback,
+                    errback_args=(token_range, pipe),
+                    )
+
+        # Wait for pending requests to finish
+        conn = session._pools.values()[0]._connection
+        while conn.in_flight > 0:
+            conn._readable = True
+            time.sleep(0.01)
+
+        pipe.close()
+        new_cluster.shutdown()
+
+    def _prepare_export_query(self, ks, cf, columns, token_range):
+        table_meta = self.get_table_meta(ks, cf)
+        pk_cols = ", ".join(protect_names(col.name for col in table_meta.partition_key))
         if columns is None:
             columns = self.get_column_names(ks, cf)
         columnlist = ', '.join(protect_names(columns))
-        query = 'SELECT %s FROM %s.%s' % (columnlist, protect_name(ks), protect_name(cf))
-        return self.session.execute(query)
+        start_token, end_token = token_range
+        query = 'SELECT %s FROM %s.%s WHERE token(%s) >= %s AND token(%s) <= %s' % (
+                columnlist, 
+                protect_name(ks), 
+                protect_name(cf),
+                pk_cols,
+                start_token,
+                pk_cols,
+                end_token,
+                )
+        return query
 
     def _setup_csv_options(self, opts):
         dialect_options = self.csv_dialect_defaults.copy()
@@ -1841,13 +2029,16 @@ class Shell(cmd.Cmd):
             dialect_options['escapechar'] = opts.pop('escape')
         if 'delimiter' in opts:
             dialect_options['delimiter'] = opts.pop('delimiter')
-        nullval = opts.pop('null', '')
-        header = bool(opts.pop('header', '').lower() == 'true')
-        encoding = opts.pop('encoding', 'utf8')
         if dialect_options['quotechar'] == dialect_options['escapechar']:
             dialect_options['doublequote'] = True
             del dialect_options['escapechar']
-        return opts, dialect_options, nullval, header, encoding
+
+        csv_options = dict()
+        csv_options['nullval'] = opts.pop('null', '')
+        csv_options['header'] = bool(opts.pop('header', '').lower() == 'true')
+        csv_options['encoding'] = opts.pop('encoding', 'utf8')
+
+        return opts, dialect_options, csv_options
 
     def do_show(self, parsed):
         """
