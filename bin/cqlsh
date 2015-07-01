@@ -52,6 +52,7 @@ import warnings
 import csv
 import getpass
 from functools import partial
+import itertools
 import traceback
 
 
@@ -790,6 +791,17 @@ class Shell(cmd.Cmd):
             raise NoKeyspaceError("Ring view requires a current non-system keyspace")
         self.conn.metadata.token_map.rebuild_keyspace(ksname, build_if_absent=True)
         return self.conn.metadata.token_map.tokens_to_hosts_by_ks[ksname]
+
+    def get_token_ranges(self):
+        """
+        Returns an iterator of the different token ranges of the cluster. For
+        example if you had a ring of nodes ["A", "B", "C", "D", "E"] then the
+        iterator would yield ("A", "B"), ("B", "C"), ..., ("D", "E"), ("E", "A")
+        """
+        ring = self.conn.metadata.token_map.ring
+        a, b = itertools.tee(ring)
+        next(b, None)
+        return itertools.izip_longest(a, b, fillvalue=ring[0])
 
     def get_table_meta(self, ksname, tablename):
         if ksname is None:
