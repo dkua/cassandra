@@ -438,6 +438,26 @@ class UserTypeNotFound(Exception):
     pass
 
 
+class NoLocalNodeError(Exception):
+    verb = "find"
+
+    def __init__(self, token, hosts, dc):
+        self.token = token
+        self.hosts = hosts
+        self.dc = dc
+
+    def __str__(self):
+        return str(self.token)
+
+    def message(self):
+        what = 'host from %s (for token %s) in current data center %s' \
+                % (', '.join(self.hosts), self.token, self.dc)
+        return 'Failed to %s %s, please use cqlsh in that DC' % (self.verb, what)
+
+    def __repr__(self):
+        return '<%s %s>' % (self.__class__.__name__, self.message())
+
+
 class DecodeError(Exception):
     verb = 'decode'
 
@@ -802,6 +822,21 @@ class Shell(cmd.Cmd):
         a, b = itertools.tee(ring)
         next(b, None)
         return itertools.izip_longest(a, b, fillvalue=ring[0])
+
+    def get_token_range_to_host(self, ksname):
+        pairs = []
+        tm = self.conn.metadata.token_map
+        dc = self.conn.metadata.get_host(self.address).datacenter
+        for token_range in self.get_token_ranges():
+            _, end_token = token_range
+            hosts = tm.get_replicas(ksname, end_token)
+            for host in hosts:
+                if host.datacenter == dc:
+                    pairs.append((token_range, host))
+                    break
+            else:
+                raise NoLocalNodeError(end_token, hosts, dc)
+        return pairs
 
     def get_table_meta(self, ksname, tablename):
         if ksname is None:
@@ -1711,6 +1746,20 @@ class Shell(cmd.Cmd):
             except IOError, e:
                 self.printerr("Can't open %r for writing: %s" % (fname, e))
                 return 0
+
+        ranges_and_hosts = self.get_token_range_to_host(ks)
+
+        from multiprocessing import Process, Pipe, cpu_count
+
+        processes = []
+        pipes = {}
+        for host in set(h for _, h in ranges_and_hosts):
+            parent_conn, child_conn = Pipe()
+            pipes[host] = parent_conn
+            processes.append(Process(target=self.multiproc_export, args=(child_conn, columns, nullval, host)))
+
+        for process in processes:
+            process.start()
 
         meter = RateMeter(10000)
         try:
