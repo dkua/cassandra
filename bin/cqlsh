@@ -1730,10 +1730,9 @@ class Shell(cmd.Cmd):
             new_cluster.shutdown()
 
     def perform_csv_export(self, ks, cf, columns, fname, opts):
-        opts, dialect_options, nullval, header, encoding = _setup_csv_options(opts)
+        opts, dialect_options, csv_options = _setup_csv_options(opts)
         if opts:
-            self.printerr('Unrecognized COPY TO options: %s'
-                          % ', '.join(opts.keys()))
+            self.printerr('Unrecognized COPY TO options: %s' % ', '.join(opts.keys()))
             return 0
 
         if fname is None:
@@ -1752,18 +1751,28 @@ class Shell(cmd.Cmd):
         from multiprocessing import Process, Pipe, cpu_count
 
         processes = []
-        pipes = {}
+        parent_conn, child_conn = Pipe()
         for host in set(h for _, h in ranges_and_hosts):
-            parent_conn, child_conn = Pipe()
-            pipes[host] = parent_conn
-            Process(target=self.multiproc_export, args=(host, child_conn, ks, cf, columns))
-            processes.append(process)
+            proc_args = (
+                    host,
+                    token_ranges,
+                    child_conn,
+                    ks,
+                    cf,
+                    columns,
+                    dialect_options,
+                    csv_options,
+                    )
+            processes.append(Process(target=self.multiproc_export, args=proc_args))
 
         for process in processes:
             process.start()
 
-        meter = RateMeter(10000)
-        return meter.current_record
+        rows_exported = 0
+        # Block and wait for all the queries to complete (either successfully or fails)
+        # Unblock once all results are in and write to file
+        # Print out errors and return successfully exported rows
+        return rows_exported
 
     def prepare_export_query(self, ks, cf, columns, token_range):
         table_meta = self.get_table_meta(ks, cf)
@@ -1782,8 +1791,8 @@ class Shell(cmd.Cmd):
                 )
         return query
 
-    def multiproc_export(self, hostname, pipe, ks, cf, columns):
-        # open a new connection for this subprocess
+    def multiproc_export(self, hostname, ranges, output, ks, cf, columns, dialect_opts, csv_opts):
+        # Open new connection to specific hostname for this subprocess
         new_cluster = Cluster(
                 contact_points=(hostname,),
                 port=self.port,
@@ -1792,60 +1801,48 @@ class Shell(cmd.Cmd):
                 auth_provider=self.auth_provider,
                 ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
                 load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
-                compression=None)
+                compression=None,
+                )
         session = new_cluster.connect(self.keyspace)
         conn = session._pools.values()[0]._connection
 
-        def result_callback(result, token_range, pipe):
-            # Create tempfile with delete=False
-            writer = csv.writer(tempfile, **dialect_options)
+        def result_callback(result, token_range, pipe, dialect_opts, csv_opts):
+            from tempfile import NamedTemporaryFile
+            f = NamedTemporaryFile(delete=False)
+            writer = csv.writer(f, **dialect_opts)
+            def fmt(value):
+                format_value(
+                    value, 
+                    output_encoding=csv_opts['encoding'],
+                    nullval=csv_opts['nullval'],
+                    time_format=self.display_time_format,
+                    float_precision=self.display_float_precision
+                    ).strval
             for row in result:
-                fmt = lambda v: \
-                        format_value(v, output_encoding=encoding, nullval=nullval,
-                                time_format=self.display_time_format,
-                                float_precision=self.display_float_precision).strval
-            writer.writerow(map(fmt, row.values()))
-                # Flush and close tempfile
-                # Pass (token_range, tempfile) back into pipe
+                writer.writerow(map(fmt, row.values()))
+            f.close()
+            pipe.send((token_range, f.name))
 
         def err_callback(err, token_range, pipe):
             pipe.send((token_range, err))
 
-        token_range = (None, None)
-        try:
-            while True:
-                try:
-                    token_range = pipe.recv()
-                except EOFError:
-                    # The pipe was closed and there's nothing to receive
-                    sys.stdout.write('Failed to read from pipe:\n\n')
-                    sys.stdout.flush()
-                    conn._writable = True
-                    conn._readable = True
-                    break
+        token_range = None
+        for token_range in ranges:
+            query = self.prepare_export_query(ks, cf, columns, token_range)
+            future = session.execute_async(query)
+            future.add_callbacks(
+                    callback=result_callback,
+                    callback_args=(token_range, output, dialect_opts, csv_opts),
+                    errback=err_callback,
+                    errback_args=(token_range, output),
+                    )
 
-                # See if the parent process has signaled that we are done
-                if token_range == (None, None):
-                    conn._writable = True
-                    conn._readable = True
-                    pipe.close()
-                    break
+        # Wait for pending requests to finish
+        while conn.in_flight > 0:
+            conn._readable = True
+            time.sleep(0.01)
 
-                query = self.prepare_export_query(ks, cf, columns, token_range)
-                future = session.execute_async(query)
-                future.add_callbacks(
-                        callback=result_callback, callback_args=(token_range, pipe),
-                        errback=err_callback, errback_args=(token_range, pipe),
-                        )
-        except Exception, exc:
-            pipe.send((token_range, exc))
-        finally:
-            # wait for any pending requests to finish
-            while conn.in_flight > 0:
-                conn._readable = True
-                time.sleep(0.01)
-
-            new_cluster.shutdown()
+        new_cluster.shutdown()
 
     def _setup_csv_options(self, opts):
         dialect_options = self.csv_dialect_defaults.copy()
@@ -1855,13 +1852,16 @@ class Shell(cmd.Cmd):
             dialect_options['escapechar'] = opts.pop('escape')
         if 'delimiter' in opts:
             dialect_options['delimiter'] = opts.pop('delimiter')
-        nullval = opts.pop('null', '')
-        header = bool(opts.pop('header', '').lower() == 'true')
-        encoding = opts.pop('encoding', 'utf8')
         if dialect_options['quotechar'] == dialect_options['escapechar']:
             dialect_options['doublequote'] = True
             del dialect_options['escapechar']
-        return opts, dialect_options, nullval, header, encoding
+
+        csv_options = dict()
+        csv_options['nullval'] = opts.pop('null', '')
+        csv_options['header'] = bool(opts.pop('header', '').lower() == 'true')
+        csv_options['encoding'] = opts.pop('encoding', 'utf8')
+
+        return opts, dialect_options, csv_options
 
     def do_show(self, parsed):
         """
