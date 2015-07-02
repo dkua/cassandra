@@ -1822,7 +1822,7 @@ class Shell(cmd.Cmd):
                     for row in tmp_reader:
                         writer.writerow(row)
                         rows_exported += 1
-                    result.close()
+                os.remove(result)
 
         if do_close:
             csvdest.close()
