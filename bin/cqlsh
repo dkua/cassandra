@@ -1756,36 +1756,96 @@ class Shell(cmd.Cmd):
         for host in set(h for _, h in ranges_and_hosts):
             parent_conn, child_conn = Pipe()
             pipes[host] = parent_conn
-            processes.append(Process(target=self.multiproc_export, args=(child_conn, columns, nullval, host)))
+            Process(target=self.multiproc_export, args=(host, child_conn, ks, cf, columns))
+            processes.append(process)
 
         for process in processes:
             process.start()
 
         meter = RateMeter(10000)
-        try:
-
-            dump = self.prep_export_dump(ks, cf, columns)
-            writer = csv.writer(csvdest, **dialect_options)
-            if header:
-                writer.writerow(columns)
-            for row in dump:
-                fmt = lambda v: \
-                    format_value(v, output_encoding=encoding, nullval=nullval,
-                                 time_format=self.display_time_format,
-                                 float_precision=self.display_float_precision).strval
-                writer.writerow(map(fmt, row.values()))
-                meter.increment()
-        finally:
-            if do_close:
-                csvdest.close()
         return meter.current_record
 
-    def prep_export_dump(self, ks, cf, columns):
+    def prepare_export_query(self, ks, cf, columns, token_range):
+        table_meta = self.get_table_meta(ks, cf)
+        pk_cols = ", ".join(protect_names(col.name for col in table_meta.partition_key))
         if columns is None:
             columns = self.get_column_names(ks, cf)
         columnlist = ', '.join(protect_names(columns))
-        query = 'SELECT %s FROM %s.%s' % (columnlist, protect_name(ks), protect_name(cf))
-        return self.session.execute(query)
+        query = 'SELECT %s FROM %s.%s WHERE TOKEN(%s) > %s AND TOKEN(%s) <= %s' % (
+                columnlist, 
+                protect_name(ks), 
+                protect_name(cf),
+                pk_cols,
+                token_range[0],
+                pk_cols,
+                token_range[1],
+                )
+        return query
+
+    def multiproc_export(self, hostname, pipe, ks, cf, columns):
+        # open a new connection for this subprocess
+        new_cluster = Cluster(
+                contact_points=(hostname,),
+                port=self.port,
+                cql_version=self.conn.cql_version,
+                protocol_version=DEFAULT_PROTOCOL_VERSION,
+                auth_provider=self.auth_provider,
+                ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
+                load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
+                compression=None)
+        session = new_cluster.connect(self.keyspace)
+        conn = session._pools.values()[0]._connection
+
+        def result_callback(result, token_range, pipe):
+            # Create tempfile with delete=False
+            writer = csv.writer(tempfile, **dialect_options)
+            for row in result:
+                fmt = lambda v: \
+                        format_value(v, output_encoding=encoding, nullval=nullval,
+                                time_format=self.display_time_format,
+                                float_precision=self.display_float_precision).strval
+            writer.writerow(map(fmt, row.values()))
+                # Flush and close tempfile
+                # Pass (token_range, tempfile) back into pipe
+
+        def err_callback(err, token_range, pipe):
+            pipe.send((token_range, err))
+
+        token_range = (None, None)
+        try:
+            while True:
+                try:
+                    token_range = pipe.recv()
+                except EOFError:
+                    # The pipe was closed and there's nothing to receive
+                    sys.stdout.write('Failed to read from pipe:\n\n')
+                    sys.stdout.flush()
+                    conn._writable = True
+                    conn._readable = True
+                    break
+
+                # See if the parent process has signaled that we are done
+                if token_range == (None, None):
+                    conn._writable = True
+                    conn._readable = True
+                    pipe.close()
+                    break
+
+                query = self.prepare_export_query(ks, cf, columns, token_range)
+                future = session.execute_async(query)
+                future.add_callbacks(
+                        callback=result_callback, callback_args=(token_range, pipe),
+                        errback=err_callback, errback_args=(token_range, pipe),
+                        )
+        except Exception, exc:
+            pipe.send((token_range, exc))
+        finally:
+            # wait for any pending requests to finish
+            while conn.in_flight > 0:
+                conn._readable = True
+                time.sleep(0.01)
+
+            new_cluster.shutdown()
 
     def _setup_csv_options(self, opts):
         dialect_options = self.csv_dialect_defaults.copy()
