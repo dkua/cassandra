@@ -832,12 +832,12 @@ class Shell(cmd.Cmd):
         """
         pairs = []
         tm = self.conn.metadata.token_map
-        dc = self.conn.metadata.get_host(self.address).datacenter
-        for token_range in self.get_token_ranges():
-            _, end_token = token_range
+        dc = self.conn.metadata.get_host(self.hostname).datacenter
+        for start_token, end_token in self.get_token_ranges():
             hosts = tm.get_replicas(ksname, end_token)
             for host in hosts:
                 if host.datacenter == dc:
+                    token_range = (start_token.value, end_token.value)
                     pairs.append((token_range, host))
                     break
             else:
@@ -1473,12 +1473,8 @@ class Shell(cmd.Cmd):
         opts = dict(zip(copyoptnames, cleancopyoptvals))
 
         timestart = time.time()
-
+        
         direction = parsed.get_binding('dir').upper()
-        self.printerr("FUCK")
-        self.printerr("FUCK")
-        self.printerr("FUCK")
-        self.printerr("FUCK")
         if direction == 'FROM':
             rows = self.perform_csv_import(ks, cf, columns, fname, opts)
             verb = 'imported'
@@ -1492,7 +1488,7 @@ class Shell(cmd.Cmd):
         print "\n%d rows %s in %s." % (rows, verb, describe_interval(timeend - timestart))
 
     def perform_csv_import(self, ks, cf, columns, fname, opts):
-        opts, dialect_options, csv_options = _setup_csv_options(opts)
+        opts, dialect_options, csv_options = self._setup_csv_options(opts)
         if opts:
             self.printerr('Unrecognized COPY FROM options: %s'
                           % ', '.join(opts.keys()))
@@ -1531,7 +1527,7 @@ class Shell(cmd.Cmd):
 
             processes, pipes = [], [],
             for i in range(num_processes):
-                parent_conn, child_conn = mult.Pipe()
+                parent_conn, child_conn = multp.Pipe()
                 pipes.append(parent_conn)
                 proc_args = (child_conn, ks, cf, columns, nullval)
                 processes.append(multp.Process(target=self.multiproc_import, args=proc_args))
@@ -1742,7 +1738,7 @@ class Shell(cmd.Cmd):
             new_cluster.shutdown()
 
     def perform_csv_export(self, ks, cf, columns, fname, opts):
-        opts, dialect_options, csv_options = _setup_csv_options(opts)
+        opts, dialect_options, csv_options = self._setup_csv_options(opts)
         if opts:
             self.printerr('Unrecognized COPY TO options: %s' % ', '.join(opts.keys()))
             return 0
@@ -1762,7 +1758,7 @@ class Shell(cmd.Cmd):
 
         try:
             # Organize the token ranges with their respective host
-            ranges_and_hosts = self.get_token_range_to_host(ks)
+            ranges_and_hosts = self.get_token_range_to_local_host(ks)
             host_to_ranges = dict()
             for token_range, host in ranges_and_hosts:
                 host_to_ranges.setdefault(host, []).append(token_range)
@@ -1780,7 +1776,7 @@ class Shell(cmd.Cmd):
         queue = multp.Queue(maxsize=len(host_to_ranges.keys()))
         for host, token_ranges in host_to_ranges.iteritems():
             proc_args = (
-                    host,
+                    host.address,
                     token_ranges,
                     queue,
                     ks,
@@ -1798,6 +1794,8 @@ class Shell(cmd.Cmd):
         # Unblock once all results are in
         # Print out errors and write tempfiles to file
         # Return number of successfully exported rows
+        time.sleep(20)
+        raise ValueError("OMASDASDSA")
         while not queue.full():
             time.sleep(0.01)
 
@@ -1847,6 +1845,7 @@ class Shell(cmd.Cmd):
         conn = session._pools.values()[0]._connection
 
         def result_callback(result, token_range, queue, dialect_opts, csv_opts):
+            raise ValueError("WTF")
             # Query has successfully completed so parse and format the results,
             # write it to a temp file and send the filename back to parent process.
             from tempfile import NamedTemporaryFile
@@ -1866,6 +1865,7 @@ class Shell(cmd.Cmd):
             queue.put((token_range, f.name))
 
         def err_callback(err, token_range, pipe):
+            raise ValueError("OMG")
             # Query errored out so send error back to parent process.
             queue.put((token_range, err))
 
@@ -1879,6 +1879,8 @@ class Shell(cmd.Cmd):
                     errback=err_callback,
                     errback_args=(token_range, queue),
                     )
+
+        raise ValueError("HOLY SHIT %s" % conn.in_flight)
 
         # Wait for pending requests to finish
         while conn.in_flight > 0: # I wonder if async requests hold in_flight until done
