@@ -1475,6 +1475,10 @@ class Shell(cmd.Cmd):
         timestart = time.time()
 
         direction = parsed.get_binding('dir').upper()
+        self.printerr("FUCK")
+        self.printerr("FUCK")
+        self.printerr("FUCK")
+        self.printerr("FUCK")
         if direction == 'FROM':
             rows = self.perform_csv_import(ks, cf, columns, fname, opts)
             verb = 'imported'
@@ -1804,25 +1808,23 @@ class Shell(cmd.Cmd):
             token_range, result = queue.get_nowait()
             results[token_range] = result
         except multp.Queue.Empty:
-            break
-
-        writer = csv.writer(csvdest, **dialect_options)
-        if csv_options["header"]:
-            writer.writerow(columns)
-        for token_range, result in results.iteritems():
-            if isinstance(result, Exception):
-                # A token range failed to be exported
-                self.printerr('\nError exporting from token range: (%s):\n' % token_range)
-                self.printerr(str(result))
-                if self.debug:
-                    traceback.print_exc()
-            else:
-                with open(result, "rb") as tmp:
-                    tmp_reader = csv.reader(tmp)
-                    for row in tmp_reader:
-                        writer.writerow(row)
-                        rows_exported += 1
-                os.remove(result)
+            writer = csv.writer(csvdest, **dialect_options)
+            if csv_options["header"]:
+                writer.writerow(columns)
+            for token_range, result in results.iteritems():
+                if isinstance(result, Exception):
+                    # A token range failed to be exported
+                    self.printerr('\nError exporting from token range: (%s):\n' % token_range)
+                    self.printerr(str(result))
+                    if self.debug:
+                        traceback.print_exc()
+                else:
+                    with open(result, "rb") as tmp:
+                        tmp_reader = csv.reader(tmp)
+                        for row in tmp_reader:
+                            writer.writerow(row)
+                            rows_exported += 1
+                    os.remove(result)
 
         if do_close:
             csvdest.close()
