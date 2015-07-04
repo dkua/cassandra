@@ -1843,7 +1843,7 @@ class Shell(cmd.Cmd):
         pipe.close()
         return rows_exported
 
-    def multiproc_export(self, hostname, ranges, queue, ks, cf, columns, dialect_opts, csv_opts):
+    def multiproc_export(self, hostname, ranges, pipe, ks, cf, columns, dialect_opts, csv_opts):
         # Open new connection to specific hostname for this subprocess
         new_cluster = Cluster(
                 contact_points=(hostname,),
@@ -1858,7 +1858,7 @@ class Shell(cmd.Cmd):
         session = new_cluster.connect(self.keyspace)
         session.row_factory = ordered_dict_factory
 
-        def result_callback(result, token_range, queue, dialect_opts, csv_opts):
+        def result_callback(result, token_range, pipe, dialect_opts, csv_opts):
             # Query has successfully completed so parse and format the results
             # if there are any, write it to a temp file and send the filename
             # back to parent process.
@@ -1882,11 +1882,11 @@ class Shell(cmd.Cmd):
                     message = f.name
             except Exception, exc:
                 message = exc
-            queue.send((token_range, message))
+            pipe.send((token_range, message))
 
         def err_callback(err, token_range, pipe):
             # Query errored out so send error back to parent process.
-            queue.send((token_range, err))
+            pipe((token_range, err))
 
         # Asynchronously run the query for all the given token ranges
         for token_range in ranges:
@@ -1894,9 +1894,9 @@ class Shell(cmd.Cmd):
             future = session.execute_async(query)
             future.add_callbacks(
                     callback=result_callback,
-                    callback_args=(token_range, queue, dialect_opts, csv_opts),
+                    callback_args=(token_range, pipe, dialect_opts, csv_opts),
                     errback=err_callback,
-                    errback_args=(token_range, queue),
+                    errback_args=(token_range, pipe),
                     )
 
         # Wait for pending requests to finish
@@ -1905,7 +1905,7 @@ class Shell(cmd.Cmd):
             conn._readable = True
             time.sleep(0.01)
 
-        queue.close()
+        pipe.close()
         new_cluster.shutdown()
 
     def _prepare_export_query(self, ks, cf, columns, token_range):
