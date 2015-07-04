@@ -837,15 +837,22 @@ class Shell(cmd.Cmd):
         pairs = []
         tm = self.conn.metadata.token_map
         dc = self.conn.metadata.get_host(self.hostname).datacenter
-        for start_token, end_token in self.get_token_ranges():
-            hosts = tm.get_replicas(ksname, end_token)
-            for host in hosts:
-                if host.datacenter == dc:
-                    token_range = (start_token.value, end_token.value)
-                    pairs.append((token_range, host))
-                    break
-            else:
-                raise NoLocalNodeError(end_token, hosts, dc)
+        #for start_token, end_token in self.get_token_ranges():
+        #    hosts = tm.get_replicas(ksname, end_token)
+        #    for host in hosts:
+        #        if host.datacenter == dc:
+        #            token_range = (start_token.value, end_token.value)
+        #            pairs.append((token_range, host))
+        #            break
+        #    else:
+        #        raise NoLocalNodeError(end_token, hosts, dc)
+        import operator
+        tokens = sorted(tm.ring, key=operator.attrgetter("value"))
+        token_range = (tokens[0].value, tokens[-1].value)
+        for host in tm.get_replicas(ksname, tokens[-1]):
+            if host.datacenter == dc:
+                pairs.append((token_range, host))
+                break
         return pairs
 
     def get_table_meta(self, ksname, tablename):
