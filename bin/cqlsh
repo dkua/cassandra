@@ -836,11 +836,12 @@ class Shell(cmd.Cmd):
     def get_token_ranges(self):
         """
         Returns a list of the different token ranges of the cluster. For example
-        if you had a ring of nodes ["A", "B", "C", "D", "E"] then the list would
-        be [("A", "B"), ("B", "C"), ("C", "D"), ("D", "E")]
+        if you had a ring of nodes [A, B, C, D, E] then the list would be 
+        [(None, A), (A, B), (B, C), (C, D), (D, E), (E, None)].
         """
-        ranges = []
         ring = self.conn.metadata.token_map.ring
+        ranges = []
+        ranges.append((None, ring[0]))
         for i in xrange(len(ring)):
             try:
                 ranges.append((ring[i], ring[i+1]))
@@ -857,15 +858,21 @@ class Shell(cmd.Cmd):
         pairs = []
         tm = self.conn.metadata.token_map
         dc = self.conn.metadata.get_host(self.hostname).datacenter
+        host = None
         for start_token, end_token in self.get_token_ranges():
             hosts = tm.get_replicas(ksname, end_token)
             for host in hosts:
                 if host.datacenter == dc:
-                    token_range = (start_token.value, end_token.value)
+                    if start_token is None:
+                        token_range = (None, end_token.value)
+                    else:
+                        token_range = (start_token.value, end_token.value)
                     pairs.append((token_range, host))
                     break
             else:
                 raise NoLocalNodeError(end_token, hosts, dc)
+        else:
+            pairs.append(((end_token.value, None), host))
         return pairs
 
     def get_table_meta(self, ksname, tablename):
@@ -1922,6 +1929,7 @@ class Shell(cmd.Cmd):
         writer = csv.writer(csvdest, **dialect_options)
         if csv_options["header"]:
             writer.writerow(columns)
+
         for token_range, result in results.iteritems():
             if result is None:
                 continue
@@ -2020,15 +2028,13 @@ class Shell(cmd.Cmd):
             columns = self.get_column_names(ks, cf)
         columnlist = ', '.join(protect_names(columns))
         start_token, end_token = token_range
-        query = 'SELECT %s FROM %s.%s WHERE token(%s) >= %s AND token(%s) <= %s' % (
-                columnlist, 
-                protect_name(ks), 
-                protect_name(cf),
-                pk_cols,
-                start_token,
-                pk_cols,
-                end_token,
-                )
+        query = 'SELECT %s FROM %s.%s WHERE' % (columnlist, protect_name(ks), protect_name(cf))
+        if start_token is not None:
+            query += ' token(%s) > %s' % (pk_cols, start_token)
+        if start_token is not None and end_token is not None:
+            query += ' AND'
+        if end_token is not None:
+            query += ' token(%s) <= %s' % (pk_cols, end_token)
         return query
 
     def _setup_csv_options(self, opts):
