@@ -1821,6 +1821,15 @@ class Shell(cmd.Cmd):
             except EOFError:
                 time.sleep(0.01)
 
+        def fmt(v):
+            return format_value(
+                    v, 
+                    output_encoding=csv_options['encoding'],
+                    nullval=csv_options['nullval'],
+                    time_format=csv_options['dtformats'],
+                    float_precision=csv_options['float_precision'],
+                    ).strval
+
         writer = csv.writer(csvdest, **dialect_options)
         if csv_options["header"]:
             writer.writerow(columns)
@@ -1836,15 +1845,11 @@ class Shell(cmd.Cmd):
                     traceback.print_exc()
             else:
                 try:
-                    with open(result, "rb") as tmp:
-                        tmp_reader = csv.reader(tmp, **dialect_options)
-                        for row in tmp_reader:
-                            writer.writerow(row)
-                            rows_exported += 1
+                    for row in result:
+                        writer.writerow(map(fmt, row.values()))
+                        rows_exported += 1
                 except Exception, e:
                     raise e
-                finally:
-                    os.remove(result)
 
         if do_close:
             csvdest.close()
@@ -1870,26 +1875,27 @@ class Shell(cmd.Cmd):
             # Query has successfully completed so parse and format the results
             # if there are any, write it to a temp file and send the filename
             # back to parent process.
-            message = None
-            try:
-                if result:
-                    from tempfile import NamedTemporaryFile
-                    f = NamedTemporaryFile(delete=False)
-                    writer = csv.writer(f, **dialect_opts)
-                    def fmt(v):
-                        return format_value(
-                                v, 
-                                output_encoding=csv_opts['encoding'],
-                                nullval=csv_opts['nullval'],
-                                time_format=csv_opts['dtformats'],
-                                float_precision=csv_opts['float_precision'],
-                                ).strval
-                    for row in result:
-                        writer.writerow(map(fmt, row.values()))
-                    f.close()
-                    message = f.name
-            except Exception, exc:
-                message = exc
+            message = result
+            #message = None
+            #try:
+            #    if result:
+            #        from tempfile import NamedTemporaryFile
+            #        f = NamedTemporaryFile(delete=False)
+            #        writer = csv.writer(f, **dialect_opts)
+            #        def fmt(v):
+            #            return format_value(
+            #                    v, 
+            #                    output_encoding=csv_opts['encoding'],
+            #                    nullval=csv_opts['nullval'],
+            #                    time_format=csv_opts['dtformats'],
+            #                    float_precision=csv_opts['float_precision'],
+            #                    ).strval
+            #        for row in result:
+            #            writer.writerow(map(fmt, row.values()))
+            #        f.close()
+            #        message = f.name
+            #except Exception, exc:
+            #    message = exc
             pipe.send((token_range, message))
 
         def err_callback(err, token_range, pipe):
