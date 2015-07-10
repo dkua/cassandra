@@ -1932,8 +1932,7 @@ class Shell(cmd.Cmd):
             else:
                 try:
                     with open(result, "rb") as tmp:
-                        tmp_reader = csv.reader(tmp, **dialect_options)
-                        for row in tmp_reader:
+                        for row in tmp:
                             writer.writerow(row)
                             rows_exported += 1
                 except Exception, e:
@@ -1947,6 +1946,7 @@ class Shell(cmd.Cmd):
         return rows_exported
 
     def multiproc_export(self, hostname, ranges, pipe, ks, cf, columns, dialect_opts, csv_opts):
+
         # Open new connection to specific hostname for this subprocess
         new_cluster = Cluster(
                 contact_points=(hostname,),
@@ -1960,50 +1960,72 @@ class Shell(cmd.Cmd):
                 )
         session = new_cluster.connect(self.keyspace)
         session.row_factory = ordered_dict_factory
+        conn = session._pools.values()[0]._connection
 
-        def result_callback(result, token_range, pipe, dialect_opts, csv_opts):
-            # Query has successfully completed so parse and format the results
-            # if there are any, write it to a temp file and send the filename
-            # back to parent process.
-            message = None
-            try:
-                if result:
-                    from tempfile import NamedTemporaryFile
-                    f = NamedTemporaryFile(delete=False)
-                    writer = csv.writer(f, **dialect_opts)
-                    def fmt(v):
-                        return format_value(
-                                v, 
-                                output_encoding=csv_opts['encoding'],
-                                nullval=csv_opts['nullval'],
-                                time_format=csv_opts['dtformats'],
-                                float_precision=csv_opts['float_precision'],
-                                ).strval
-                    for row in result:
-                        writer.writerow(map(fmt, row.values()))
-                    f.close()
-                    message = f.name
-            except Exception, exc:
-                message = exc
-            pipe.send((token_range, message))
+        class ResultHandler(object):
+            def __init__(self, token_range, pipe, future, dialect_opts, csv_opts):
+                self.token_range = token_range
+                self.pipe = pipe
+                self.dialect_opts = dialect_opts
+                self.csv_opts = csv_opts
+                self.future = future
+                self.future.add_callbacks(
+                        callback=self.result_callback,
+                        errback=self.err_callback,
+                        )
+                self.tempfile = None
+                self.writer = None
 
-        def err_callback(err, token_range, pipe):
-            # Query errored out so send error back to parent process.
-            pipe((token_range, err))
+            def result_callback(self, result):
+                # Query has successfully completed so parse and format the results
+                # if there are any, write it to a temp file and send the filename
+                # back to parent process.
+                try:
+                    if result:
+                        if self.tempfile is None:
+                            from tempfile import NamedTemporaryFile
+                            self.tempfile = NamedTemporaryFile(delete=False)
+                            self.writer = csv.writer(self.tempfile, **self.dialect_opts)
+                        for row in result:
+                            self.writer.writerow(map(self.fmt, row.values()))
+                        if self.future.has_more_pages:
+                            self.future.start_fetching_next_page()
+                        else:
+                            self.tempfile.close()
+                            self.pipe.send((self.token_range, self.tempfile.name))
+                            conn.in_flight -= 1
+                    else:
+                        self.pipe.send((self.token_range, None))
+                        conn.in_flight -= 1
+                except Exception, exc:
+                    self.pipe.send((self.token_range, message))
+                    os.remove(self.tempfile.name)
+                    conn.in_flight -= 1
+
+            def err_callback(self, err):
+                # Query errored out so send error back to parent process.
+                self.pipe((self.token_range, err))
+                conn.in_flight -= 1
+
+            def fmt(self, v):
+                return format_value(
+                        v,
+                        output_encoding=self.csv_opts['encoding'],
+                        nullval=self.csv_opts['nullval'],
+                        time_format=self.csv_opts['dtformats'],
+                        float_precision=self.csv_opts['float_precision'],
+                        ).strval
 
         # Asynchronously run the query for all the given token ranges
+        num = 0
         for token_range in ranges:
             query = self._prepare_export_query(ks, cf, columns, token_range)
             future = session.execute_async(query)
-            future.add_callbacks(
-                    callback=result_callback,
-                    callback_args=(token_range, pipe, dialect_opts, csv_opts),
-                    errback=err_callback,
-                    errback_args=(token_range, pipe),
-                    )
+            ResultHandler(token_range, pipe, future, dialect_opts, csv_opts)
+            with conn.lock:
+                conn.in_flight += 1
 
         # Wait for pending requests to finish
-        conn = session._pools.values()[0]._connection
         while conn.in_flight > 0:
             conn._readable = True
             time.sleep(0.01)
