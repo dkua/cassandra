@@ -1915,28 +1915,33 @@ class Shell(cmd.Cmd):
 
         # Block and wait for all the processes to return the results.
         # Print out any errors and concatenate the result tempfiles to the destination.
-        results = []
-        while len(results) < num_processes:
+        processed = []
+        while len(processed) < num_processes:
             try:
-                results.append(pipe.recv())
+                processed.append(pipe.recv())
             except EOFError:
                 time.sleep(0.05)
 
-        for errors, result in results:
-            for token_range, err in errors:
-                # A token range failed to be exported
-                self.printerr('\nError exporting from token range: (%d, %d):\n' % token_range)
-                self.printerr(str(err))
-            if result is not None:
-                try:
-                    with open(result, "rb") as tmp:
-                        for line in tmp:
-                            csvdest.write(line)
-                            rows_exported += 1
-                except Exception, e:
-                    raise e
-                finally:
-                    os.remove(result)
+        errors, results = [], []
+        for e, r in processed:
+            errors.extend(e)
+            results.extend(r)
+
+        for token_range, err in errors:
+            # A token range failed to be exported
+            self.printerr('\nError exporting from token range: (%d, %d):\n' % token_range)
+            self.printerr(str(err))
+
+        for token_range, result in sorted(results):
+            try:
+                with open(result, "rb") as tmp:
+                    for line in tmp:
+                        csvdest.write(line)
+                        rows_exported += 1
+            except Exception, e:
+                raise e
+            finally:
+                os.remove(result)
 
         if do_close:
             csvdest.close()
@@ -1944,7 +1949,6 @@ class Shell(cmd.Cmd):
         return rows_exported
 
     def multiproc_export(self, jobs, pipe, ks, cf, columns, dialect_opts, csv_opts):
-
         # Create all the sessions for all the given hosts
         hosts_to_node = dict()
         for hostname, _ in jobs:
@@ -1965,11 +1969,8 @@ class Shell(cmd.Cmd):
                 hosts_to_node[hostname] = (new_cluster, session)
 
         import collections
+        errors = collections.deque()
         results = collections.deque()
-
-        from tempfile import NamedTemporaryFile
-        tmp = NamedTemporaryFile(delete=False)
-        writer = csv.writer(tmp, **dialect_opts)
 
         class ResultHandler(object):
             def __init__(self, token_range, future):
@@ -1988,15 +1989,18 @@ class Shell(cmd.Cmd):
                     if self.future.has_more_pages:
                         self.future.start_fetching_next_page()
                     else:
-                        for row in self.result:
-                            writer.writerow(map(fmt, row.values()))
-                        results.append(None)
+                        from tempfile import NamedTemporaryFile
+                        with NamedTemporaryFile(delete=False) as tmp:
+                            writer = csv.writer(tmp, **dialect_opts)
+                            for row in self.result:
+                                writer.writerow(map(fmt, row.values()))
+                            results.append((self.token_range, tmp.name))
                 except Exception, exc:
-                    results.append((self.token_range, exc))
+                    errors.append((self.token_range, exc))
 
             def err_callback(self, err):
                 # Query errored out so add error to results deque.
-                results.append((self.token_range, exc))
+                errors.append((self.token_range, err))
 
         def fmt(v):
             return format_value(
@@ -2015,12 +2019,10 @@ class Shell(cmd.Cmd):
             ResultHandler(token_range, future)
 
         # Wait for all the results to come in
-        while len(results) < len(jobs):
+        while (len(results) + len(errors)) < len(jobs):
             time.sleep(0.01)
 
-        tmp.close()
-        errors = filter(None, results)
-        pipe.send((errors, tmp.name))
+        pipe.send((errors, results))
         pipe.close()
 
         for cluster, _ in hosts_to_node.values():
