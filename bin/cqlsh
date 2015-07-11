@@ -1863,14 +1863,19 @@ class Shell(cmd.Cmd):
                 self.printerr("Can't open %r for writing: %s" % (fname, e))
                 return 0
 
+        if csv_options["header"]:
+            writer = csv.writer(csvdest, **dialect_options)
+            writer.writerow(columns)
+
         rows_exported = 0
 
         try:
             # Organize the token ranges with their respective host
             ranges_and_hosts = self.get_token_range_to_local_host(ks)
-            host_to_ranges = dict()
+            host_to_ranges = []
             for token_range, host in ranges_and_hosts:
-                host_to_ranges.setdefault(host, []).append(token_range)
+                host_to_ranges.append((host.address, token_range))
+            host_to_ranges = sorted(host_to_ranges)
         except NoLocalNodeError, exc:
             # We failed before we started because a token range had no local nodes
             self.printerr('\nError starting export process:\n')
@@ -1879,14 +1884,23 @@ class Shell(cmd.Cmd):
                 traceback.print_exc()
             return rows_exported
 
-        # Create and start a subprocess for each host that runs multiproc_export() on
-        # the token ranges that the host owns
+        try:
+            num_processes = max(1, min(4, multp.cpu_count() - 1))
+        except NotImplementedError:
+            num_processes = 1
+
+
+        # Split the jobs, (Host, Range), evenly across the processes and start them
         processes = []
         pipe, conn = multp.Pipe()
-        for host, token_ranges in host_to_ranges.iteritems():
+        num_jobs = int(len(host_to_ranges) / num_processes)
+        for i in xrange(num_processes):
+            if i == num_processes-1:
+                jobs = host_to_ranges[num_jobs*i:]
+            else:
+                jobs = host_to_ranges[num_jobs*i:num_jobs*i+num_jobs]
             proc_args = (
-                    host.address,
-                    token_ranges,
+                    jobs,
                     conn,
                     ks,
                     cf,
@@ -1899,41 +1913,25 @@ class Shell(cmd.Cmd):
         for process in processes:
             process.start()
 
-        # Block and wait for all the queries to complete (either successfully or fails)
-        # Unblock once all results are in
-        # Print out errors and write tempfiles to file
-        # Return number of successfully exported rows
-        from collections import OrderedDict
-        results = OrderedDict((token_ranges, None) for token_ranges, _ in ranges_and_hosts)
-
-        results_expected = len(results)
-        results_received = 0
-        while results_received < results_expected:
+        # Block and wait for all the processes to return the results.
+        # Print out any errors and concatenate the result tempfiles to the destination.
+        results = []
+        while len(results) < num_processes:
             try:
-                token_range, result = pipe.recv()
-                results[token_range] = result
-                results_received += 1
+                results.append(pipe.recv())
             except EOFError:
-                time.sleep(0.01)
+                time.sleep(0.05)
 
-        writer = csv.writer(csvdest, **dialect_options)
-        if csv_options["header"]:
-            writer.writerow(columns)
-
-        for token_range, result in results.iteritems():
-            if result is None:
-                continue
-            elif isinstance(result, Exception):
+        for errors, result in results:
+            for token_range, err in errors:
                 # A token range failed to be exported
                 self.printerr('\nError exporting from token range: (%d, %d):\n' % token_range)
-                self.printerr(str(result))
-                if self.debug:
-                    traceback.print_exc()
-            else:
+                self.printerr(str(err))
+            if result is not None:
                 try:
                     with open(result, "rb") as tmp:
-                        for row in tmp:
-                            writer.writerow(row)
+                        for line in tmp:
+                            csvdest.write(line)
                             rows_exported += 1
                 except Exception, e:
                     raise e
@@ -1945,93 +1943,88 @@ class Shell(cmd.Cmd):
         pipe.close()
         return rows_exported
 
-    def multiproc_export(self, hostname, ranges, pipe, ks, cf, columns, dialect_opts, csv_opts):
+    def multiproc_export(self, jobs, pipe, ks, cf, columns, dialect_opts, csv_opts):
 
-        # Open new connection to specific hostname for this subprocess
-        new_cluster = Cluster(
-                contact_points=(hostname,),
-                port=self.port,
-                cql_version=self.conn.cql_version,
-                protocol_version=DEFAULT_PROTOCOL_VERSION,
-                auth_provider=self.auth_provider,
-                ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
-                load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
-                compression=None,
-                )
-        session = new_cluster.connect(self.keyspace)
-        session.row_factory = ordered_dict_factory
-        conn = session._pools.values()[0]._connection
+        # Create all the sessions for all the given hosts
+        hosts_to_node = dict()
+        for hostname, _ in jobs:
+            if hostname not in hosts_to_node:
+                new_cluster = Cluster(
+                        contact_points=(hostname,),
+                        port=self.port,
+                        cql_version=self.conn.cql_version,
+                        protocol_version=DEFAULT_PROTOCOL_VERSION,
+                        auth_provider=self.auth_provider,
+                        ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
+                        load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
+                        compression=None,
+                        )
+                session = new_cluster.connect(self.keyspace)
+                session.row_factory = ordered_dict_factory
+
+                hosts_to_node[hostname] = (new_cluster, session)
+
+        import collections
+        results = collections.deque()
+
+        from tempfile import NamedTemporaryFile
+        tmp = NamedTemporaryFile(delete=False)
+        writer = csv.writer(tmp, **dialect_opts)
 
         class ResultHandler(object):
-            def __init__(self, token_range, pipe, future, dialect_opts, csv_opts):
+            def __init__(self, token_range, future):
                 self.token_range = token_range
-                self.pipe = pipe
-                self.dialect_opts = dialect_opts
-                self.csv_opts = csv_opts
                 self.future = future
                 self.future.add_callbacks(
                         callback=self.result_callback,
                         errback=self.err_callback,
                         )
-                self.tempfile = None
-                self.writer = None
+                self.result = collections.deque()
 
-            def result_callback(self, result):
-                # Query has successfully completed so parse and format the results
-                # if there are any, write it to a temp file and send the filename
-                # back to parent process.
+            def result_callback(self, rows):
+                # Query has successfully completed so aggregate rows and then write to file.
                 try:
-                    if result:
-                        if self.tempfile is None:
-                            from tempfile import NamedTemporaryFile
-                            self.tempfile = NamedTemporaryFile(delete=False)
-                            self.writer = csv.writer(self.tempfile, **self.dialect_opts)
-                        for row in result:
-                            self.writer.writerow(map(self.fmt, row.values()))
-                        if self.future.has_more_pages:
-                            self.future.start_fetching_next_page()
-                        else:
-                            self.tempfile.close()
-                            self.pipe.send((self.token_range, self.tempfile.name))
-                            conn.in_flight -= 1
+                    self.result.extend(rows)
+                    if self.future.has_more_pages:
+                        self.future.start_fetching_next_page()
                     else:
-                        self.pipe.send((self.token_range, None))
-                        conn.in_flight -= 1
+                        for row in self.result:
+                            writer.writerow(map(fmt, row.values()))
+                        results.append(None)
                 except Exception, exc:
-                    self.pipe.send((self.token_range, message))
-                    os.remove(self.tempfile.name)
-                    conn.in_flight -= 1
+                    results.append((self.token_range, exc))
 
             def err_callback(self, err):
-                # Query errored out so send error back to parent process.
-                self.pipe((self.token_range, err))
-                conn.in_flight -= 1
+                # Query errored out so add error to results deque.
+                results.append((self.token_range, exc))
 
-            def fmt(self, v):
-                return format_value(
-                        v,
-                        output_encoding=self.csv_opts['encoding'],
-                        nullval=self.csv_opts['nullval'],
-                        time_format=self.csv_opts['dtformats'],
-                        float_precision=self.csv_opts['float_precision'],
-                        ).strval
+        def fmt(v):
+            return format_value(
+                    v,
+                    output_encoding=csv_opts['encoding'],
+                    nullval=csv_opts['nullval'],
+                    time_format=csv_opts['dtformats'],
+                    float_precision=csv_opts['float_precision'],
+                    ).strval
 
         # Asynchronously run the query for all the given token ranges
-        num = 0
-        for token_range in ranges:
+        for hostname, token_range in jobs:
             query = self._prepare_export_query(ks, cf, columns, token_range)
+            _, session = hosts_to_node[hostname]
             future = session.execute_async(query)
-            ResultHandler(token_range, pipe, future, dialect_opts, csv_opts)
-            with conn.lock:
-                conn.in_flight += 1
+            ResultHandler(token_range, future)
 
-        # Wait for pending requests to finish
-        while conn.in_flight > 0:
-            conn._readable = True
+        # Wait for all the results to come in
+        while len(results) < len(jobs):
             time.sleep(0.01)
 
+        tmp.close()
+        errors = filter(None, results)
+        pipe.send((errors, tmp.name))
         pipe.close()
-        new_cluster.shutdown()
+
+        for cluster, _ in hosts_to_node.values():
+            cluster.shutdown()
 
     def _prepare_export_query(self, ks, cf, columns, token_range):
         table_meta = self.get_table_meta(ks, cf)
