@@ -35,7 +35,10 @@ from uuid import UUID
 description = "CQL Shell for Apache Cassandra"
 version = "5.0.1"
 
-from StringIO import StringIO
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from io import StringIO
 from contextlib import contextmanager
 from glob import glob
 
@@ -54,7 +57,7 @@ import getpass
 from functools import partial
 import multiprocessing as multp
 import itertools
-import collections
+import ctypes
 import traceback
 
 
@@ -112,7 +115,7 @@ except ImportError, e:
              'Error: %s\n' % (sys.executable, sys.path, e))
 
 from cassandra.cluster import Cluster, PagedResult
-from cassandra.query import SimpleStatement, ordered_dict_factory
+from cassandra.query import SimpleStatement, ordered_dict_factory, tuple_factory
 from cassandra.policies import WhiteListRoundRobinPolicy
 from cassandra.protocol import QueryMessage, ResultMessage
 from cassandra.metadata import protect_name, protect_names, protect_value
@@ -824,6 +827,15 @@ class Shell(cmd.Cmd):
         self.conn.metadata.token_map.rebuild_keyspace(ksname, build_if_absent=True)
         return self.conn.metadata.token_map.tokens_to_hosts_by_ks[ksname]
 
+    def get_min_token(self):
+        partitioner = self.conn.metadata.partitioner
+        if partitioner.endswith('RandomPartitioner'):
+            return -1
+        elif partitioner.endswith('Murmur3Partitioner'):
+            return -(2 ** 63)   # -9223372036854775808
+        elif partitioner.endswith('ByteOrderedPartitioner'):
+            return ""
+
     def get_token_ranges(self):
         """
         Returns a list of the different token ranges of the cluster. For example
@@ -832,12 +844,16 @@ class Shell(cmd.Cmd):
         """
         ring = self.conn.metadata.token_map.ring
         ranges = []
-        ranges.append((None, ring[0]))
+        # Don't query for the min token as that will wrap around and query for the ENTIRE range.
+        if ring[0].value != self.get_min_token():
+            ranges.append((None, ring[0]))
         for i in xrange(len(ring)):
             try:
                 ranges.append((ring[i], ring[i+1]))
             except IndexError:
                 continue
+        else:
+            ranges.append((ring[i], None))
         return ranges
 
     def get_token_range_to_local_host(self, ksname):
@@ -851,19 +867,23 @@ class Shell(cmd.Cmd):
         dc = self.conn.metadata.get_host(self.hostname).datacenter
         host = None
         for start_token, end_token in self.get_token_ranges():
-            hosts = tm.get_replicas(ksname, end_token)
+            if end_token is None:
+                hosts = tm.get_replicas(ksname, start_token)
+            else:
+                hosts = tm.get_replicas(ksname, end_token)
+
             for host in hosts:
                 if host.datacenter == dc:
                     if start_token is None:
                         token_range = (None, end_token.value)
+                    elif end_token is None:
+                        token_range = (start_token.value, None)
                     else:
                         token_range = (start_token.value, end_token.value)
                     pairs.append((token_range, host))
                     break
             else:
                 raise NoLocalNodeError(end_token, hosts, dc)
-        else:
-            pairs.append(((end_token.value, None), host))
         return pairs
 
     def get_table_meta(self, ksname, tablename):
@@ -1619,8 +1639,6 @@ class Shell(cmd.Cmd):
                 linesource.next()
             reader = csv.reader(linesource, **dialect_options)
 
-            from multiprocessing import Process, Pipe, cpu_count
-
             # Pick a resonable number of child processes. We need to leave at
             # least one core for the parent process.  This doesn't necessarily
             # need to be capped at 4, but it's currently enough to keep
@@ -1869,7 +1887,6 @@ class Shell(cmd.Cmd):
             writer.writerow(columns)
 
         meter = RateMeter(10000)
-
         try:
             # Organize the token ranges with their respective host
             ranges_and_hosts = self.get_token_range_to_local_host(ks)
@@ -1886,15 +1903,15 @@ class Shell(cmd.Cmd):
             return meter.current_record
 
         try:
-            num_processes = max(1, min(4, multp.cpu_count() - 1))
+            num_processes = max(1, multp.cpu_count() - 1)
         except NotImplementedError:
             num_processes = 1
 
 
         # Split the jobs, (Host, Range), evenly across the processes and start them
         processes = []
-        pipe, conn = multp.Pipe()
-        num_jobs = int(len(host_to_ranges) / num_processes)
+        queue = multp.Queue()
+        num_jobs = max(1, int(len(host_to_ranges) / num_processes))
         for i in xrange(num_processes):
             if i == num_processes-1:
                 jobs = host_to_ranges[num_jobs*i:]
@@ -1902,7 +1919,7 @@ class Shell(cmd.Cmd):
                 jobs = host_to_ranges[num_jobs*i:num_jobs*i+num_jobs]
             proc_args = (
                     jobs,
-                    conn,
+                    queue,
                     ks,
                     cf,
                     columns,
@@ -1916,107 +1933,120 @@ class Shell(cmd.Cmd):
 
         # Block and wait for all the processes to return the results.
         # Print out any errors and concatenate the result tempfiles to the destination.
+        lock = multp.Lock()
+        count = multp.Value(ctypes.c_int, lock=lock)
         try:
-            processed = 0
-            while processed < len(host_to_ranges):
-                token_range, result = pipe.recv()
-                if isinstance(result, Exception):
-                    self.printerr('\nerror exporting from token range: (%d, %d):\n' % token_range)
+            while True:
+                if count.value == len(processes) and queue.empty():
+                    break
+                token_range, result = queue.get()
+                if token_range is None and result is None:
+                    count.value += 1
+                elif isinstance(result, Exception):
+                    self.printerr('\nerror exporting from token range: %s:\n' % str(token_range))
                     self.printerr(str(result))
                 else:
-                    with open(result, "rb") as tmp:
-                        for line in tmp:
-                            csvdest.write(line)
-                            meter.increment()
-                    os.remove(result)
-                processed += 1
+                    data, num = result
+                    csvdest.write(data)
+                    meter.increment(n=num)
         except Exception, e:
             raise e
         finally:
+            queue.close()
             if do_close:
                 csvdest.close()
-            pipe.close()
         return meter.current_record
 
-    def multiproc_export(self, jobs, pipe, ks, cf, columns, dialect_opts, csv_opts):
+    def multiproc_export(self, jobs, queue, ks, cf, columns, dialect_options, csv_options):
         # Create all the sessions for all the given hosts
-        hosts_to_node = dict()
-        for hostname, _ in jobs:
-            if hostname not in hosts_to_node:
-                new_cluster = Cluster(
-                        contact_points=(hostname,),
-                        port=self.port,
-                        cql_version=self.conn.cql_version,
-                        protocol_version=DEFAULT_PROTOCOL_VERSION,
-                        auth_provider=self.auth_provider,
-                        ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
-                        load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
-                        compression=None,
-                        )
-                session = new_cluster.connect(self.keyspace)
-                session.row_factory = ordered_dict_factory
+        try:
+            hosts_to_node = dict()
+            for hostname, _ in jobs:
+                if hostname not in hosts_to_node:
+                    new_cluster = Cluster(
+                            contact_points=(hostname,),
+                            port=self.port,
+                            cql_version=self.conn.cql_version,
+                            protocol_version=DEFAULT_PROTOCOL_VERSION,
+                            auth_provider=self.auth_provider,
+                            ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
+                            load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
+                            compression=None,
+                            )
+                    session = new_cluster.connect(self.keyspace)
+                    session.row_factory = tuple_factory
+                    hosts_to_node[hostname] = (new_cluster, session)
 
-                hosts_to_node[hostname] = (new_cluster, session)
+            class ResultHandler(object):
+                def __init__(self, token_range, future):
+                    self.token_range = token_range
+                    self.future = future
+                    self.future.add_callbacks(
+                            callback=self.result_callback,
+                            errback=self.err_callback,
+                            )
 
-        results = collections.deque()
-        class ResultHandler(object):
-            def __init__(self, token_range, future):
-                self.token_range = token_range
-                self.future = future
-                self.future.add_callbacks(
-                        callback=self.result_callback,
-                        errback=self.err_callback,
-                        )
-                self.result = collections.deque()
+                def result_callback(self, rows):
+                    # Query has successfully completed so aggregate rows and then write to file.
+                    output = StringIO()
+                    writer = csv.writer(output, **dialect_options)
+                    for row in rows:
+                        writer.writerow(map(fmt, row))
+                    data = (output.getvalue(), len(rows))
+                    queue.put((self.token_range, data))
+                    output.close()
 
-            def result_callback(self, rows):
-                # Query has successfully completed so aggregate rows and then write to file.
-                try:
-                    self.result.extend(rows)
                     if self.future.has_more_pages:
                         self.future.start_fetching_next_page()
                     else:
-                        from tempfile import NamedTemporaryFile
-                        tmp = NamedTemporaryFile(delete=False)
-                        writer = csv.writer(tmp, **dialect_opts)
-                        for row in self.result:
-                            writer.writerow(map(fmt, row.values()))
-                        tmp.close()
-                        pipe.send((self.token_range, tmp.name))
-                        results.append(self.token_range)
-                except Exception, exc:
-                    pipe.send((self.token_range, exc))
-                    results.append(self.token_range)
+                        self.next()
 
-            def err_callback(self, err):
-                # Query errored out so add error to results deque.
-                pipe.send((self.token_range, err))
-                results.append(self.token_range)
+                def err_callback(self, err):
+                    # Query errored out so add error to results deque.
+                    queue.put((self.token_range, err))
+                    self.next()
 
-        def fmt(v):
-            return format_value(
-                    v,
-                    output_encoding=csv_opts['encoding'],
-                    nullval=csv_opts['nullval'],
-                    time_format=csv_opts['dtformats'],
-                    float_precision=csv_opts['float_precision'],
-                    ).strval
+                def next(self):
+                    count.value += 1
+                    start_job()
 
-        # Asynchronously run the query for all the given token ranges
-        for hostname, token_range in jobs:
-            query = self._prepare_export_query(ks, cf, columns, token_range)
-            _, session = hosts_to_node[hostname]
-            future = session.execute_async(query)
-            ResultHandler(token_range, future)
+            def fmt(v):
+                return format_value(
+                        v,
+                        output_encoding=csv_options['encoding'],
+                        nullval=csv_options['nullval'],
+                        time_format=csv_options['dtformats'],
+                        float_precision=csv_options['float_precision'],
+                        ).strval
 
-        # Wait for all the results to come in
-        while len(results) < len(jobs):
-            time.sleep(0.01)
+            # Asynchronously run the query for all the given token ranges
+            lock = multp.Lock()
+            count = multp.Value(ctypes.c_int, lock=lock)
+            num_jobs = len(jobs)
+            def start_job():
+                try:
+                    hostname, token_range = jobs.pop()
+                    query = self._prepare_export_query(ks, cf, columns, token_range)
+                    _, session = hosts_to_node[hostname]
+                    future = session.execute_async(query)
+                    ResultHandler(token_range, future)
+                except IndexError:
+                    pass
 
-        pipe.close()
+            for _ in xrange(min(12, num_jobs)):
+                start_job()
 
-        for cluster, _ in hosts_to_node.values():
-            cluster.shutdown()
+            # Wait for all the results to come in
+            while count.value < num_jobs:
+                time.sleep(1)
+
+        except Exception, e:
+            raise e
+        finally:
+            queue.put((None, None))
+            queue.close()
+            for cluster, _ in hosts_to_node.values():
+                cluster.shutdown()
 
     def _prepare_export_query(self, ks, cf, columns, token_range):
         table_meta = self.get_table_meta(ks, cf)
@@ -2417,24 +2447,30 @@ class RateMeter(object):
         self.current_rate = 0.0
         self.current_record = 0
 
-    def increment(self):
-        self.current_record += 1
+    def increment(self, n=1):
+        self.current_record += n
 
-        if (self.current_record % self.log_rate) == 0:
-            new_checkpoint_time = time.time()
-            new_rate = self.log_rate / (new_checkpoint_time - self.last_checkpoint_time)
-            self.last_checkpoint_time = new_checkpoint_time
+        if (n > 1):
+            rate = n
+        elif (self.current_record % self.log_rate == 0):
+            rate = self.log_rate
+        else:
+            return
 
-            # smooth the rate a bit
-            if self.current_rate == 0.0:
-                self.current_rate = new_rate
-            else:
-                self.current_rate = (self.current_rate + new_rate) / 2.0
+        new_checkpoint_time = time.time()
+        new_rate = rate / (new_checkpoint_time - self.last_checkpoint_time)
+        self.last_checkpoint_time = new_checkpoint_time
 
-            output = 'Processed %s rows; Write: %.2f rows/s\r' % \
-                     (self.current_record, self.current_rate)
-            sys.stdout.write(output)
-            sys.stdout.flush()
+        # smooth the rate a bit
+        if self.current_rate == 0.0:
+            self.current_rate = new_rate
+        else:
+            self.current_rate = (self.current_rate + new_rate) / 2.0
+
+        output = 'Processed %s rows; Write: %.2f rows/s\r' % \
+                 (self.current_record, self.current_rate)
+        sys.stdout.write(output)
+        sys.stdout.flush()
 
 
 class SwitchCommand(object):
