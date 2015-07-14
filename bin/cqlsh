@@ -54,6 +54,7 @@ import getpass
 from functools import partial
 import multiprocessing as multp
 import itertools
+import collections
 import traceback
 
 
@@ -1957,9 +1958,7 @@ class Shell(cmd.Cmd):
 
                 hosts_to_node[hostname] = (new_cluster, session)
 
-        import collections
         results = collections.deque()
-
         class ResultHandler(object):
             def __init__(self, token_range, future):
                 self.token_range = token_range
@@ -1978,11 +1977,12 @@ class Shell(cmd.Cmd):
                         self.future.start_fetching_next_page()
                     else:
                         from tempfile import NamedTemporaryFile
-                        with NamedTemporaryFile(delete=False) as tmp:
-                            writer = csv.writer(tmp, **dialect_opts)
-                            for row in self.result:
-                                writer.writerow(map(fmt, row.values()))
-                            pipe.send((self.token_range, tmp.name))
+                        tmp = NamedTemporaryFile(delete=False)
+                        writer = csv.writer(tmp, **dialect_opts)
+                        for row in self.result:
+                            writer.writerow(map(fmt, row.values()))
+                        tmp.close()
+                        pipe.send((self.token_range, tmp.name))
                         results.append(self.token_range)
                 except Exception, exc:
                     pipe.send((self.token_range, exc))
