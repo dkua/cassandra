@@ -1870,6 +1870,9 @@ class Shell(cmd.Cmd):
 
         meter = RateMeter(10000)
 
+        output = "Attempting to export\n"
+        sys.stdout.write(output)
+        sys.stdout.flush()
         try:
             # Organize the token ranges with their respective host
             ranges_and_hosts = self.get_token_range_to_local_host(ks)
@@ -1884,6 +1887,10 @@ class Shell(cmd.Cmd):
             if self.debug:
                 traceback.print_exc()
             return meter.current_record
+
+        output = "Hosts computed\n\n%s\n\n" % host_to_ranges
+        sys.stdout.write(output)
+        sys.stdout.flush()
 
         try:
             num_processes = max(1, min(4, multp.cpu_count() - 1))
@@ -1914,6 +1921,10 @@ class Shell(cmd.Cmd):
         for process in processes:
             process.start()
 
+        output = "Procs started\n"
+        sys.stdout.write(output)
+        sys.stdout.flush()
+
         # Block and wait for all the processes to return the results.
         # Print out any errors and concatenate the result tempfiles to the destination.
         try:
@@ -1939,24 +1950,37 @@ class Shell(cmd.Cmd):
         return meter.current_record
 
     def multiproc_export(self, jobs, pipe, ks, cf, columns, dialect_opts, csv_opts):
+        import logging
+        logger = logging.getLogger('multiproc_export')
+        hdlr = logging.FileHandler('/home/vagrant/data/%s.log' % multp.current_process().name)
+        formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+        hdlr.setFormatter(formatter)
+        logger.addHandler(hdlr) 
+        logger.setLevel(logging.WARNING)
         # Create all the sessions for all the given hosts
-        hosts_to_node = dict()
-        for hostname, _ in jobs:
-            if hostname not in hosts_to_node:
-                new_cluster = Cluster(
-                        contact_points=(hostname,),
-                        port=self.port,
-                        cql_version=self.conn.cql_version,
-                        protocol_version=DEFAULT_PROTOCOL_VERSION,
-                        auth_provider=self.auth_provider,
-                        ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
-                        load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
-                        compression=None,
-                        )
-                session = new_cluster.connect(self.keyspace)
-                session.row_factory = ordered_dict_factory
+        try:
+            hosts_to_node = dict()
+            for hostname, _ in jobs:
+                if hostname not in hosts_to_node:
+                    new_cluster = Cluster(
+                            contact_points=(hostname,),
+                            port=self.port,
+                            cql_version=self.conn.cql_version,
+                            protocol_version=DEFAULT_PROTOCOL_VERSION,
+                            auth_provider=self.auth_provider,
+                            ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
+                            load_balancing_policy=WhiteListRoundRobinPolicy([hostname]),
+                            compression=None,
+                            )
+                    session = new_cluster.connect(self.keyspace)
+                    session.row_factory = ordered_dict_factory
 
-                hosts_to_node[hostname] = (new_cluster, session)
+                    hosts_to_node[hostname] = (new_cluster, session)
+        except Exception, e:
+            logger.error("Failed at connections: %s" % e)
+            raise e
+        
+        logger.error("CONNECTED")
 
         results = collections.deque()
         class ResultHandler(object):
@@ -1967,31 +1991,40 @@ class Shell(cmd.Cmd):
                         callback=self.result_callback,
                         errback=self.err_callback,
                         )
-                self.result = collections.deque()
+                from tempfile import NamedTemporaryFile
+                self.tempfile = NamedTemporaryFile(delete=False)
+                self.writer = csv.writer(self.tempfile, **dialect_opts)
+                self.ii = 0
 
             def result_callback(self, rows):
                 # Query has successfully completed so aggregate rows and then write to file.
                 try:
-                    self.result.extend(rows)
+                    for row in rows:
+                        self.writer.writerow(map(fmt, row.values()))
+
                     if self.future.has_more_pages:
+                        self.ii += 1
+                        logger.error("FETCHING PAGE %d" % self.ii)
                         self.future.start_fetching_next_page()
                     else:
-                        from tempfile import NamedTemporaryFile
-                        tmp = NamedTemporaryFile(delete=False)
-                        writer = csv.writer(tmp, **dialect_opts)
-                        for row in self.result:
-                            writer.writerow(map(fmt, row.values()))
-                        tmp.close()
-                        pipe.send((self.token_range, tmp.name))
+                        self.tempfile.close()
+                        pipe.send((self.token_range, self.tempfile.name))
                         results.append(self.token_range)
+                        logger.error("CALLBACKED")
                 except Exception, exc:
                     pipe.send((self.token_range, exc))
                     results.append(self.token_range)
+                    logger.error("CALLBACKED WITH ERR")
+                    self.tempfile.close()
+                    os.remove(self.tempfile.name)
 
             def err_callback(self, err):
                 # Query errored out so add error to results deque.
                 pipe.send((self.token_range, err))
                 results.append(self.token_range)
+                logger.error("ERRBACKED")
+                self.tempfile.close()
+                os.remove(self.tempfile.name)
 
         def fmt(v):
             return format_value(
@@ -2002,21 +2035,28 @@ class Shell(cmd.Cmd):
                     float_precision=csv_opts['float_precision'],
                     ).strval
 
-        # Asynchronously run the query for all the given token ranges
-        for hostname, token_range in jobs:
-            query = self._prepare_export_query(ks, cf, columns, token_range)
-            _, session = hosts_to_node[hostname]
-            future = session.execute_async(query)
-            ResultHandler(token_range, future)
+        try:
+            # Asynchronously run the query for all the given token ranges
+            for hostname, token_range in jobs:
+                query = self._prepare_export_query(ks, cf, columns, token_range)
+                _, session = hosts_to_node[hostname]
+                future = session.execute_async(query)
+                ResultHandler(token_range, future)
+        except Exception, e:
+            logger.error("Failed to async: %s" % e)
+            raise e
+        logger.error("ASYNCD")
 
         # Wait for all the results to come in
         while len(results) < len(jobs):
+            logger.error("%d/%d" % (len(results), len(jobs)))
             time.sleep(0.01)
 
         pipe.close()
 
         for cluster, _ in hosts_to_node.values():
             cluster.shutdown()
+        logger.error("DONE")
 
     def _prepare_export_query(self, ks, cf, columns, token_range):
         table_meta = self.get_table_meta(ks, cf)
