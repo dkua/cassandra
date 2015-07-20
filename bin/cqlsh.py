@@ -199,7 +199,10 @@ if not os.path.exists(HISTORY_DIR):
 
 OLD_CONFIG_FILE = os.path.expanduser(os.path.join('~', '.cqlshrc'))
 if os.path.exists(OLD_CONFIG_FILE):
-    os.rename(OLD_CONFIG_FILE, CONFIG_FILE)
+    if os.path.exists(CONFIG_FILE):
+        print '\nWarning: Found cqlshrc at both `%s` and `%s`. Using the latter.\n' % (OLD_CONFIG_FILE, CONFIG_FILE)
+    else:
+        os.rename(OLD_CONFIG_FILE, CONFIG_FILE)
 OLD_HISTORY = os.path.expanduser(os.path.join('~', '.cqlsh_history'))
 if os.path.exists(OLD_HISTORY):
     os.rename(OLD_HISTORY, HISTORY)
