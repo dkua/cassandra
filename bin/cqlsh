@@ -1998,6 +1998,19 @@ class Shell(cmd.Cmd):
 
                 def result_callback(self, rows):
                     # Query has successfully completed so aggregate rows and then write to file.
+                    if self.future.has_more_pages:
+                        self.future.start_fetching_next_page()
+                        self.return_results(rows)
+                    else:
+                        self.return_results(rows)
+                        self.next()
+
+                def err_callback(self, err):
+                    # Query errored out so add error to results deque.
+                    queue.put((self.token_range, err))
+                    self.next()
+
+                def return_results(self, rows):
                     output = StringIO()
                     writer = csv.writer(output, **dialect_options)
                     for row in rows:
@@ -2005,16 +2018,6 @@ class Shell(cmd.Cmd):
                     data = (output.getvalue(), len(rows))
                     queue.put((self.token_range, data))
                     output.close()
-
-                    if self.future.has_more_pages:
-                        self.future.start_fetching_next_page()
-                    else:
-                        self.next()
-
-                def err_callback(self, err):
-                    # Query errored out so add error to results deque.
-                    queue.put((self.token_range, err))
-                    self.next()
 
                 def next(self):
                     count.value += 1
