@@ -115,9 +115,9 @@ except ImportError, e:
              'Error: %s\n' % (sys.executable, sys.path, e))
 
 from cassandra.cluster import Cluster, PagedResult
-from cassandra.query import SimpleStatement, ordered_dict_factory, tuple_factory
+from cassandra.query import SimpleStatement, ordered_dict_factory, tuple_factory, BatchType
 from cassandra.policies import WhiteListRoundRobinPolicy
-from cassandra.protocol import QueryMessage, ResultMessage
+from cassandra.protocol import QueryMessage, ResultMessage, BatchMessage
 from cassandra.metadata import protect_name, protect_names, protect_value
 from cassandra.auth import PlainTextAuthProvider
 
@@ -1649,23 +1649,35 @@ class Shell(cmd.Cmd):
             except NotImplementedError:
                 num_processes = 1
 
+            ranges_and_hosts = self.get_token_range_to_local_host(ks)
+            hosts = itertools.cycle(set(host.address for _, host in ranges_and_hosts))
+
             processes, pipes = [], [],
             for i in range(num_processes):
                 parent_conn, child_conn = multp.Pipe()
                 pipes.append(parent_conn)
-                proc_args = (child_conn, ks, cf, columns, nullval)
+                proc_args = (next(hosts), child_conn, ks, cf, columns, nullval)
                 processes.append(multp.Process(target=self.multiproc_import, args=proc_args))
+
+            pipe_iter = itertools.cycle(pipes)
 
             for process in processes:
                 process.start()
 
             meter = RateMeter(10000)
+            rows = []
+            batch_size = 50
             for current_record, row in enumerate(reader, start=1):
+                while len(rows) < batch_size:
+                    rows.append(row)
+                    meter.increment()
+
                 # write to the child process
-                pipes[current_record % num_processes].send((current_record, row))
+                pipe = next(pipe_iter)
+                pipe.send((current_record, rows))
 
                 # update the progress and current rate periodically
-                meter.increment()
+                rows = []
 
                 # check for any errors reported by the children
                 if (current_record % 100) == 0:
@@ -1675,6 +1687,16 @@ class Shell(cmd.Cmd):
                     else:
                         # errors seen, break out of outer loop
                         break
+            else:
+                # write to the child process
+                index = (current_record / len(rows)) % num_processes
+                pipes[index].send((current_record, rows))
+                rows = []
+
+                # check for any errors reported by the children
+                if (current_record % 100) == 0:
+                    self._check_child_pipes(current_record, pipes)
+
         except Exception, exc:
             if current_record is None:
                 # we failed before we started
@@ -1733,7 +1755,7 @@ class Shell(cmd.Cmd):
                     return False
         return True
 
-    def multiproc_import(self, pipe, ks, cf, columns, nullval):
+    def multiproc_import(self, host, pipe, ks, cf, columns, nullval):
         """
         This method is where child processes start when doing a COPY FROM
         operation.  The child process will open one connection to the node and
@@ -1744,13 +1766,13 @@ class Shell(cmd.Cmd):
 
         # open a new connection for this subprocess
         new_cluster = Cluster(
-                contact_points=(self.hostname,),
+                contact_points=(host,),
                 port=self.port,
                 cql_version=self.conn.cql_version,
                 protocol_version=DEFAULT_PROTOCOL_VERSION,
                 auth_provider=self.auth_provider,
-                ssl_options=sslhandling.ssl_settings(self.hostname, CONFIG_FILE) if self.ssl else None,
-                load_balancing_policy=WhiteListRoundRobinPolicy([self.hostname]),
+                ssl_options=sslhandling.ssl_settings(host, CONFIG_FILE) if self.ssl else None,
+                load_balancing_policy=WhiteListRoundRobinPolicy([host]),
                 compression=None,
                 connect_timeout=self.conn.connect_timeout)
         session = new_cluster.connect(self.keyspace)
@@ -1758,9 +1780,8 @@ class Shell(cmd.Cmd):
 
         # pre-build as much of the query as we can
         table_meta = self.get_table_meta(ks, cf)
-        pk_cols = [col.name for col in table_meta.primary_key]
+        pk_map = dict((columns.index(c.name), c.name) for c in table_meta.primary_key)
         cqltypes = [table_meta.columns[name].typestring for name in columns]
-        pk_indexes = [columns.index(col.name) for col in table_meta.primary_key]
         query = 'INSERT INTO %s.%s (%s) VALUES (%%s)' % (
             protect_name(ks),
             protect_name(cf),
@@ -1769,7 +1790,44 @@ class Shell(cmd.Cmd):
         # we need to handle some types specially
         should_escape = [t in ('ascii', 'text', 'timestamp', 'date', 'time', 'inet') for t in cqltypes]
 
-        insert_timestamp = int(time.time() * 1e6)
+        def prep_query(row):
+            # format the values in the row
+            for i, value in enumerate(row):
+                if value != nullval:
+                    if should_escape[i]:
+                        row[i] = protect_value(value)
+                elif i in pk_map:
+                    # By default, nullval is an empty string. See CASSANDRA-7792 for details.
+                    message = "Cannot insert null value for primary key column '%s'." % pk_map[i]
+                    if nullval == '':
+                        message += " If you want to insert empty strings, consider using " \
+                                   "the WITH NULL=<marker> option for COPY."
+                    pipe.send((current_record, message))
+                    return
+                else:
+                    row[i] = 'null'
+            return query % ','.join(row)
+
+        def prep_batch_message(request_id, rows):
+            insert_timestamp = int(time.time() * 1e6)
+            queries = []
+            for row in rows:
+                query = prep_query(row)
+                queries.append((False, query, ()))
+
+            batch_message = BatchMessage(
+                    BatchType.LOGGED,
+                    queries,
+                    self.consistency_level,
+                    serial_consistency_level=None,
+                    timestamp=insert_timestamp,
+                    )
+            binary_message = batch_message.to_binary(
+                    stream_id=request_id,
+                    protocol_version=DEFAULT_PROTOCOL_VERSION,
+                    compression=None,
+                    )
+            return binary_message
 
         def callback(record_num, response):
             # This is the callback we register for all inserts.  Because this
@@ -1788,17 +1846,18 @@ class Shell(cmd.Cmd):
         current_record = 0
         insert_num = 0
         try:
+            max_in_flight = conn.max_request_id * 0.9
             while True:
                 # To avoid totally maxing out the connection,
                 # defer to the reactor thread when we're close
                 # to capacity
-                if conn.in_flight > (conn.max_request_id * 0.9):
+                if conn.in_flight > max_in_flight:
                     conn._readable = True
                     time.sleep(0.05)
                     continue
 
                 try:
-                    (current_record, row) = pipe.recv()
+                    (current_record, rows) = pipe.recv()
                 except EOFError:
                     # the pipe was closed and there's nothing to receive
                     sys.stdout.write('Failed to read from pipe:\n\n')
@@ -1808,36 +1867,14 @@ class Shell(cmd.Cmd):
                     break
 
                 # see if the parent process has signaled that we are done
-                if (current_record, row) == (None, None):
+                if (current_record, rows) == (None, None):
                     conn._writable = True
                     conn._readable = True
                     pipe.close()
                     break
 
-                # format the values in the row
-                for i, value in enumerate(row):
-                    if value != nullval:
-                        if should_escape[i]:
-                            row[i] = protect_value(value)
-                    elif i in pk_indexes:
-                        # By default, nullval is an empty string. See CASSANDRA-7792 for details.
-                        message = "Cannot insert null value for primary key column '%s'." % (pk_cols[i],)
-                        if nullval == '':
-                            message += " If you want to insert empty strings, consider using " \
-                                       "the WITH NULL=<marker> option for COPY."
-                        pipe.send((current_record, message))
-                        return
-                    else:
-                        row[i] = 'null'
-
-                full_query = query % (','.join(row),)
-                query_message = QueryMessage(
-                    full_query, self.consistency_level, serial_consistency_level=None,
-                    fetch_size=None, paging_state=None, timestamp=insert_timestamp)
-
                 request_id = conn.get_request_id()
-                binary_message = query_message.to_binary(
-                    stream_id=request_id, protocol_version=DEFAULT_PROTOCOL_VERSION, compression=None)
+                binary_message = prep_batch_message(request_id, rows)
 
                 # add the message directly to the connection's queue
                 with conn.lock:
