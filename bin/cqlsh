@@ -831,11 +831,11 @@ class Shell(cmd.Cmd):
     def get_keyspaces(self):
         return self.conn.metadata.keyspaces.values()
 
-    def get_ring(self, ksname):
-        if ksname is None or ksname == 'system':
+    def get_ring(self):
+        if self.current_keyspace is None or self.current_keyspace == 'system':
             raise NoKeyspaceError("Ring view requires a current non-system keyspace")
-        self.conn.metadata.token_map.rebuild_keyspace(ksname, build_if_absent=True)
-        return self.conn.metadata.token_map.tokens_to_hosts_by_ks[ksname]
+        self.conn.metadata.token_map.rebuild_keyspace(self.current_keyspace, build_if_absent=True)
+        return self.conn.metadata.token_map.tokens_to_hosts_by_ks[self.current_keyspace]
 
     def get_min_token(self):
         partitioner = self.conn.metadata.partitioner
@@ -845,6 +845,8 @@ class Shell(cmd.Cmd):
             return -(2 ** 63)   # -9223372036854775808
         elif partitioner.endswith('ByteOrderedPartitioner'):
             return ""
+        elif partitioner.endswith('OrderPreservingPartitioner'):
+            return ""
 
     def get_token_ranges(self):
         """
@@ -853,6 +855,8 @@ class Shell(cmd.Cmd):
         [(None, A), (A, B), (B, C), (C, D), (D, E), (E, None)].
         """
         ring = self.conn.metadata.token_map.ring
+        if len(ring) == 0:
+            return ring
         ranges = []
         # Don't query for the min token as that will wrap around and query for the ENTIRE range.
         if ring[0].value != self.get_min_token():
@@ -1449,7 +1453,7 @@ class Shell(cmd.Cmd):
         if self.current_keyspace is not None \
         and self.current_keyspace != 'system':
             print "Range ownership:"
-            ring = self.get_ring(self.current_keyspace) 
+            ring = self.get_ring()
             for entry in ring.items():
                 print ' %39s  [%s]' % (str(entry[0].value), ', '.join([host.address for host in entry[1]]))
             print
@@ -1609,7 +1613,7 @@ class Shell(cmd.Cmd):
         opts = dict(zip(copyoptnames, cleancopyoptvals))
 
         timestart = time.time()
-        
+
         direction = parsed.get_binding('dir').upper()
         if direction == 'FROM':
             rows = self.perform_csv_import(ks, cf, columns, fname, opts)
@@ -1877,7 +1881,7 @@ class Shell(cmd.Cmd):
         if opts:
             self.printerr('Unrecognized COPY TO options: %s' % ', '.join(opts.keys()))
             return 0
-        
+
         csv_options['dtformats'] = self.display_time_format
         csv_options['float_precision'] = self.display_float_precision
 
@@ -2463,17 +2467,16 @@ class RateMeter(object):
     def increment(self, n=1):
         self.current_record += n
 
-        if (n > 1):
-            rate = n
-        elif (self.current_record % self.log_rate == 0):
-            rate = self.log_rate
-        else:
-            return
-
         new_checkpoint_time = time.time()
-        new_rate = rate / (new_checkpoint_time - self.last_checkpoint_time)
-        self.last_checkpoint_time = new_checkpoint_time
+        difference = new_checkpoint_time - self.last_checkpoint_time
+        if difference != 0.0:
+            if n > 1:
+                self.log(n / difference)
+            else:
+                self.log(self.log_rate / difference)
+            self.last_checkpoint_time = new_checkpoint_time
 
+    def log(self, new_rate):
         # smooth the rate a bit
         if self.current_rate == 0.0:
             self.current_rate = new_rate
