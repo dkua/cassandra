@@ -2470,19 +2470,13 @@ class RateMeter(object):
         new_checkpoint_time = time.time()
         difference = new_checkpoint_time - self.last_checkpoint_time
         if difference != 0.0:
-            if n > 1:
-                self.log(n / difference)
-            else:
-                self.log(self.log_rate / difference)
+            new_rate = n / difference
+            self.current_rate = (self.current_rate + new_rate) / 2.0
+        if difference >= self.log_rate:
+            self.log()
             self.last_checkpoint_time = new_checkpoint_time
 
-    def log(self, new_rate):
-        # smooth the rate a bit
-        if self.current_rate == 0.0:
-            self.current_rate = new_rate
-        else:
-            self.current_rate = (self.current_rate + new_rate) / 2.0
-
+    def log(self):
         output = 'Processed %s rows; Write: %.2f rows/s\r' % \
                  (self.current_record, self.current_rate)
         sys.stdout.write(output)
