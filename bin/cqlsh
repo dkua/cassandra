@@ -854,10 +854,12 @@ class Shell(cmd.Cmd):
         if you had a ring of nodes [A, B, C, D, E] then the list would be 
         [(None, A), (A, B), (B, C), (C, D), (D, E), (E, None)].
         """
-        ring = self.conn.metadata.token_map.ring
-        if len(ring) == 0:
-            return ring
-        ranges = []
+        ring, ranges = [], []
+        if hasattr(self.conn.metadata.token_map, "ring"):
+            ring = self.conn.metadata.token_map.ring
+        if ring is None or len(ring) == 0:
+            return ranges
+
         # Don't query for the min token as that will wrap around and query for the ENTIRE range.
         if ring[0].value != self.get_min_token():
             ranges.append((None, ring[0]))
@@ -1904,10 +1906,12 @@ class Shell(cmd.Cmd):
         try:
             # Organize the token ranges with their respective host
             ranges_and_hosts = self.get_token_range_to_local_host(ks)
-            host_to_ranges = []
-            for token_range, host in ranges_and_hosts:
-                host_to_ranges.append((host.address, token_range))
-            host_to_ranges = sorted(host_to_ranges)
+            host_to_ranges = [(self.hostname, (None, None))]
+            if len(ranges_and_hosts) != 0:
+                host_to_ranges = []
+                for token_range, host in ranges_and_hosts:
+                    host_to_ranges.append((host.address, token_range))
+                host_to_ranges = sorted(host_to_ranges)
         except NoLocalNodeError, exc:
             # We failed before we started because a token range had no local nodes
             self.printerr('\nError starting export process:\n')
@@ -2072,7 +2076,9 @@ class Shell(cmd.Cmd):
             columns = self.get_column_names(ks, cf)
         columnlist = ', '.join(protect_names(columns))
         start_token, end_token = token_range
-        query = 'SELECT %s FROM %s.%s WHERE' % (columnlist, protect_name(ks), protect_name(cf))
+        query = 'SELECT %s FROM %s.%s' % (columnlist, protect_name(ks), protect_name(cf))
+        if start_token is not None or end_token is not None:
+            query += ' WHERE'
         if start_token is not None:
             query += ' token(%s) > %s' % (pk_cols, start_token)
         if start_token is not None and end_token is not None:
