@@ -1595,10 +1595,12 @@ class Shell(cmd.Cmd):
           HEADER=false     - whether to ignore the first line
           NULL=''          - string that represents a null value
           ENCODING='utf8'  - encoding for CSV output (COPY TO only)
+          JOBS='12'        - the number of jobs each process can work on at a time (COPY TO only)
 
         When entering CSV data on STDIN, you can use the sequence "\."
         on a line by itself to end the data input.
         """
+
         ks = self.cql_unprotect_name(parsed.get_binding('ksname', None))
         if ks is None:
             ks = self.current_keyspace
@@ -2059,7 +2061,7 @@ class Shell(cmd.Cmd):
                 except IndexError:
                     pass
 
-            for _ in xrange(min(12, num_jobs)):
+            for _ in xrange(min(csv_options["jobs"], num_jobs)):
                 start_job()
 
             # Wait for all the results to come in
@@ -2108,6 +2110,7 @@ class Shell(cmd.Cmd):
         csv_options['nullval'] = opts.pop('null', '')
         csv_options['header'] = bool(opts.pop('header', '').lower() == 'true')
         csv_options['encoding'] = opts.pop('encoding', 'utf8')
+        csv_options['jobs'] = int(opts.pop('jobs', 12))
 
         return opts, dialect_options, csv_options
 
