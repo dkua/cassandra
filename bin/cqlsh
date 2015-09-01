@@ -882,6 +882,11 @@ class Shell(cmd.Cmd):
         tm = self.conn.metadata.token_map
         dc = self.conn.metadata.get_host(self.hostname).datacenter
         host = None
+
+        partitioner = self.conn.metadata.partitioner
+        if partitioner.endswith('ByteOrderedPartitioner'):
+            return pairs
+
         for start_token, end_token in self.get_token_ranges():
             if end_token is None:
                 hosts = tm.get_replicas(ksname, start_token)
